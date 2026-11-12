@@ -1,0 +1,320 @@
+-------------------------------------------------------------------------------
+      name:  <unnamed>
+       log:  d:\OneDrive - m.gduf.edu.cn\工作杂项\stata\异方差_log.log
+  log type:  text
+ opened on:   9 Nov 2026, 16:47:29
+
+. * 如需纯文本，改用: log using "异方差_log.txt", text replace
+. 
+. * ============================================================
+. * 异方差(Heteroskedasticity)检验与诊断作图
+. * 数据集 : nerlove.dta  (Nerlove 电力成本函数数据)
+. * 回归   : lntc 对 lnq lnpl lnpk lnpf
+. * ============================================================
+. 
+. * --- 载入数据（请确保 nerlove.dta 在当前工作目录下） ---
+. use "C:\Users\mgghhh\Desktop\2026异方差研究生金融计量经济学再补充材料\nerlove
+> .dta", clear
+(Nerlove 1963 paper)
+
+. 
+. * --- 查看数据概况 ---
+. describe
+
+Contains data from C:\Users\mgghhh\Desktop\2026异方差研究生金融计量经济学再补充
+> 材料\nerlove.dta
+ Observations:           145                  Nerlove 1963 paper
+    Variables:            10                  30 Jan 2024 14:24
+-------------------------------------------------------------------------------
+Variable      Storage   Display    Value
+    name         type    format    label      Variable label
+-------------------------------------------------------------------------------
+tc              float   %9.0g                 total cost
+q               int     %8.0g                 total output
+pl              float   %9.0g                 price of labor
+pf              float   %9.0g                 price of fuel
+pk              int     %8.0g                 user cost of capital
+lntc            float   %9.0g                 log(tc)
+lnq             float   %9.0g                 log(q)
+lnpf            float   %9.0g                 log(pf)
+lnpk            float   %9.0g                 log(pk)
+lnpl            float   %9.0g                 log(pl)
+-------------------------------------------------------------------------------
+Sorted by: 
+
+. summarize
+
+    Variable |        Obs        Mean    Std. dev.       Min        Max
+-------------+---------------------------------------------------------
+          tc |        145     12.9761    19.79458       .082    139.422
+           q |        145    2133.083    2931.942          2      16719
+          pl |        145    1.976552    .2300404        1.5        2.3
+          pf |        145    26.17655    7.876071       10.3       42.8
+          pk |        145    174.4966    18.20948        138        233
+-------------+---------------------------------------------------------
+        lntc |        145    1.724663    1.421723  -2.501036   4.937505
+         lnq |        145    6.556651    1.912792   .6931472   9.724301
+        lnpf |        145    3.208858    .3589002   2.332144   3.756538
+        lnpk |        145    5.156777    .1003898   4.927254   5.451038
+        lnpl |        145    .6743732    .1197522   .4054651   .8329091
+
+. 
+. * ============================================================
+. * 1. 基本回归模型
+. * ============================================================
+. regress lntc lnq lnpl lnpk lnpf
+
+      Source |       SS           df       MS      Number of obs   =       145
+-------------+----------------------------------   F(4, 140)       =    437.90
+       Model |  269.524728         4  67.3811819   Prob > F        =    0.0000
+    Residual |  21.5420958       140  .153872113   R-squared       =    0.9260
+-------------+----------------------------------   Adj R-squared   =    0.9239
+       Total |  291.066823       144  2.02129738   Root MSE        =    .39227
+
+------------------------------------------------------------------------------
+        lntc | Coefficient  Std. err.      t    P>|t|     [95% conf. interval]
+-------------+----------------------------------------------------------------
+         lnq |   .7209135   .0174337    41.35   0.000     .6864462    .7553808
+        lnpl |   .4559645    .299802     1.52   0.131    -.1367602    1.048689
+        lnpk |  -.2151476   .3398295    -0.63   0.528    -.8870089    .4567136
+        lnpf |   .4258137   .1003218     4.24   0.000     .2274721    .6241554
+       _cons |  -3.566513   1.779383    -2.00   0.047    -7.084448   -.0485779
+------------------------------------------------------------------------------
+
+. estimates store model1
+
+. 
+. * 生成残差、拟合值
+. predict yhat, xb                 // 拟合值
+
+. predict residuals, residuals     // 残差
+
+. gen residuals2   = residuals^2   // 残差平方
+
+. gen absresid     = abs(residuals) // 残差绝对值
+
+. 
+. * ============================================================
+. * 2. 诊断图
+. * ============================================================
+. * 2.1 残差 vs 拟合值（喇叭状 → 异方差）
+. graph twoway (scatter residuals yhat, msymbol(oh) msize(small))        (lfit 
+> residuals yhat, lcolor(cranberry) lwidth(medium)),        title("Residuals vs
+>  Fitted")        xtitle("Fitted values") ytitle("Residuals")        name(g1, 
+> replace)
+
+. 
+. * 2.2 残差平方 vs 拟合值
+. graph twoway (scatter residuals2 yhat, msymbol(oh) msize(small))        (lfit
+>  residuals2 yhat, lcolor(edkblue) lwidth(medium)),        title("Residual^2 v
+> s Fitted")        xtitle("Fitted values") ytitle("Residual^2")        name(g2
+> , replace)
+
+. 
+. * 2.3 残差平方 vs 对数产出 lnq（常体现方差随规模变化）
+. graph twoway (scatter residuals2 lnq, msymbol(oh) msize(small))        (lfit 
+> residuals2 lnq, lcolor(green) lwidth(medium)),        title("Residual^2 vs ln
+> q")        xtitle("lnq") ytitle("Residual^2")        name(g3, replace)
+
+. 
+. * 合成一张诊断图
+. graph combine g1 g2 g3, title("异方差诊断图")        name(het_diag, replace) 
+> ysize(4) xsize(6)
+
+. 
+. * ============================================================
+. * 3. 异方差检验（五种方法）
+. * ============================================================
+. di _n "================= 异方差检验 ================="
+
+================= 异方差检验 =================
+
+. 
+. * ============================================================
+. * 检验一：Breusch-Pagan 检验
+. * 原假设 H0: 同方差；p<0.05 → 拒绝 H0，存在异方差
+. * ============================================================
+. di _n "--- 检验一: Breusch-Pagan 检验 ---"
+
+--- 检验一: Breusch-Pagan 检验 ---
+
+. estat hettest, iid
+
+Breusch–Pagan/Cook–Weisberg test for heteroskedasticity 
+Assumption: i.i.d. error terms
+Variable: Fitted values of lntc
+
+H0: Constant variance
+
+    chi2(1) =  29.13
+Prob > chi2 = 0.0000
+
+. 
+. * ============================================================
+. * 检验二：White 检验（最稳健，含交叉项与平方项）
+. * ============================================================
+. di _n "--- 检验二: White 检验 ---"
+
+--- 检验二: White 检验 ---
+
+. estat imtest, white
+
+White's test
+H0: Homoskedasticity
+Ha: Unrestricted heteroskedasticity
+
+   chi2(14) =  73.88
+Prob > chi2 = 0.0000
+
+Cameron & Trivedi's decomposition of IM-test
+
+--------------------------------------------------
+              Source |       chi2     df         p
+---------------------+----------------------------
+  Heteroskedasticity |      73.88     14    0.0000
+            Skewness |      22.79      4    0.0001
+            Kurtosis |       2.62      1    0.1055
+---------------------+----------------------------
+               Total |      99.29     19    0.0000
+--------------------------------------------------
+
+. 
+. * ============================================================
+. * 检验三：Goldfeld-Quandt 检验
+. * 按某变量(此处用 lnq)排序，舍去中间样本，比较前后两段残差方差
+. * ============================================================
+. di _n "--- 检验三: Goldfeld-Quandt 检验 ---"
+
+--- 检验三: Goldfeld-Quandt 检验 ---
+
+. gsort lnq
+
+. gen order = _n
+
+. local c = int(_N/4)                                    // 中间舍弃的样本数
+
+. qui regress lntc lnq lnpl lnpk lnpf if order <= (_N - _N/2)/2     // 前半段
+
+. scalar rss1 = e(rss)
+
+. scalar n1   = e(df_r)
+
+. qui regress lntc lnq lnpl lnpk lnpf if order >  (_N + _N/2)/2     // 后半段
+
+. scalar rss2 = e(rss)
+
+. scalar n2   = e(df_r)
+
+. scalar F_gq = (rss2/n2) / (rss1/n1)
+
+. scalar p_gq = Ftail(n2, n1, F_gq)
+
+. di "前半段残差方差 = " %10.4f rss1/n1
+前半段残差方差 =     0.3201
+
+. di "后半段残差方差 = " %10.4f rss2/n2
+后半段残差方差 =     0.0242
+
+. di "F 统计量      = " %6.3f F_gq
+F 统计量      =  0.076
+
+. di "p值           = " %6.4f p_gq
+p值           = 1.0000
+
+. di "结论: " cond(p_gq < 0.05, "拒绝 H0，存在异方差", "不能拒绝 H0，视为同方差
+> ")
+结论: 不能拒绝 H0，视为同方差
+
+. 
+. * ============================================================
+. * 检验四：Glejser 检验
+. * 用 |残差| 对解释变量回归，考察其显著性
+. * ============================================================
+. di _n "--- 检验四: Glejser 检验 ---"
+
+--- 检验四: Glejser 检验 ---
+
+. qui regress absresid lnq lnpl lnpk lnpf
+
+. test lnq lnpl lnpk lnpf
+
+ ( 1)  lnq = 0
+ ( 2)  lnpl = 0
+ ( 3)  lnpk = 0
+ ( 4)  lnpf = 0
+
+       F(  4,   140) =   16.30
+            Prob > F =    0.0000
+
+. di "结论: " cond(r(p) < 0.05, "拒绝 H0，存在异方差", "不能拒绝 H0，视为同方差
+> ")
+结论: 拒绝 H0，存在异方差
+
+. 
+. * ============================================================
+. * 检验五：Spearman 秩相关检验
+. * 对 |残差| 与各解释变量做 Spearman 秩相关，显著则存在异方差
+. * ============================================================
+. di _n "--- 检验五: Spearman 秩相关检验 ---"
+
+--- 检验五: Spearman 秩相关检验 ---
+
+. spearman absresid lnq lnpl lnpk lnpf, star(0.05)
+
+Number of observations = 145
+
+             | absresid      lnq     lnpl     lnpk     lnpf
+-------------+---------------------------------------------
+    absresid |   1.0000 
+         lnq |  -0.3506*  1.0000 
+        lnpl |   0.2560*  0.0740   1.0000 
+        lnpk |   0.0043  -0.0701  -0.1536   1.0000 
+        lnpf |   0.2894* -0.2019*  0.3649*  0.1104   1.0000 
+
+. di "结论: 任一带 * 号的变量表明其与|残差|秩相关显著 → 提示存在异方差"
+结论: 任一带 * 号的变量表明其与|残差|秩相关显著 → 提示存在异方差
+
+. 
+. * ============================================================
+. * 4. 结果汇总
+. * ============================================================
+. di _n "================= 检验结果汇总 ================="
+
+================= 检验结果汇总 =================
+
+. di "1) Breusch-Pagan      : 见 estat hettest 输出"
+1) Breusch-Pagan      : 见 estat hettest 输出
+
+. di "2) White              : 见 estat imtest, white 输出"
+2) White              : 见 estat imtest, white 输出
+
+. di "3) Goldfeld-Quandt    : F = " %6.3f F_gq " , p = " %6.4f p_gq
+3) Goldfeld-Quandt    : F =  0.076 , p = 1.0000
+
+. di "4) Spearman           : 见上方秩相关表(带*显著)"
+4) Spearman           : 见上方秩相关表(带*显著)
+
+. summarize residuals residuals2
+
+    Variable |        Obs        Mean    Std. dev.       Min        Max
+-------------+---------------------------------------------------------
+   residuals |        145   -7.36e-10    .3867789  -.9720341   1.809853
+  residuals2 |        145    .1485662    .3837846   2.94e-06   3.275568
+
+. 
+. * 生成图（如需保存到磁盘，取消下一行注释）
+. * graph export "异方差诊断图.png", replace width(1600)
+. 
+. display "异方差检验与作图完成！"
+异方差检验与作图完成！
+
+. 
+. * ============================================================
+. * 关闭日志并保存
+. * ============================================================
+. log close _all
+      name:  <unnamed>
+       log:  d:\OneDrive - m.gduf.edu.cn\工作杂项\stata\异方差_log.log
+  log type:  text
+ closed on:   9 Nov 2026, 16:47:47
+-------------------------------------------------------------------------------

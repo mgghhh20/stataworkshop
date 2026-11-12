@@ -1,0 +1,2759 @@
+
+. 
+. capture which esttab
+
+. global have_esttab = (_rc == 0)
+
+. display "esttab 可用: $have_esttab （=0 时表格自动改用内置 estimates table 输出）"
+esttab 可用: 1 （=0 时表格自动改用内置 estimates table 输出）
+
+. 
+. local data_path "D:/OneDrive - m.gduf.edu.cn/工作杂项/python/AA论文大全/DATA"
+
+. 
+. * 变量清单（对应 notebook cell 8 的三组清单）
+. global cols_to_winsor   "tobinq subsidy rd lev cf salesq bm gm roe roa"
+
+. global center_vars      "subsidy rd lev cf salesq roa gm roe bm"
+
+. global interaction_vars "subsidy_rd subsidy_rd2 subsidy_lev rd_lev salesq_sub"
+
+. 
+. *==============================================================================
+. * 工具程序 1：prepare_panel —— 对应 notebook 的 prepare_panel()
+. *   用法：
+. *     prepare_panel, winsor                                   // 只缩尾（cell 9）
+. *     prepare_panel, impute(varlist) dropna(varlist)          // 完整流水线（cell 19/64）
+. *     prepare_panel                                           // 只中心化+交互项（cell 41）
+. *   要点：缩尾只对非缺失值做（notebook 特别强调：缺失值参与分位数会导致上侧不缩尾）。
+. *==============================================================================
+. capture program drop prepare_panel
+
+. program define prepare_panel
+  1.     syntax [, WInsor IMpute(varlist) DROPna(varlist) NoCenter]
+  2. 
+.     * (a) 1%/99% 缩尾
+.     if "`winsor'" != "" {
+  3.         foreach v of global cols_to_winsor {
+  4.             quietly summarize `v', detail
+  5.             local lo = r(p1)
+  6.             local hi = r(p99)
+  7.             quietly replace `v' = `lo' if !missing(`v') & `v' < `lo'
+  8.             quietly replace `v' = `hi' if !missing(`v') & `v' > `hi'
+  9.         }
+ 10.         display "  [prepare_panel] 已完成 1%/99% 缩尾（只对非缺失值）"
+ 11.     }
+ 12. 
+.     * (b) 企业内线性插值（TobinQ 不插值；不用未来值回填过去）
+.     *     对应 pandas: groupby('Code')[cols].transform(
+.     *         lambda x: x.interpolate(method='linear', limit_direction='forward'))
+.     *     即：中间缺口线性插值，尾部缺口用最近的前值填补，首部缺口保持缺失。
+.     *     注意插值间距：pandas 是按行号（reset_index 后的 RangeIndex）计算间距的，
+.     *     不是按自然时间；因此这里同样按"企业内行号"插值，保证与 notebook 完全一致
+.     *     （只有存在整段缺失行的企业，如 LEAPMOTOR，两种口径才会有差别）。
+.     if "`impute'" != "" {
+ 13.         capture drop __rowid
+ 14.         quietly bysort panel_id (time): gen long __rowid = _n
+ 15.         foreach v of varlist `impute' {
+ 16.             capture drop __ip
+ 17.             capture ipolate `v' __rowid, gen(__ip) by(panel_id)
+ 18.             capture quietly replace `v' = __ip if missing(`v') & !missing(__ip)
+ 19.             capture drop __ip
+ 20.             forvalues k = 1/40 {
+ 21.                 capture quietly bysort panel_id (time): replace `v' = `v'[_n-1] if missing(`v')
+ 22.             }
+ 23.         }
+ 24.         capture drop __rowid
+ 25.         display "  [prepare_panel] 已完成企业内线性插值（TobinQ 与被解释变量除外）"
+ 26.     }
+ 27. 
+.     * (c) 剔除仍然不完整的观测（必须在中心化之前，保证 *_c 均值严格为 0）
+.     if "`dropna'" != "" {
+ 28.         quietly egen __rowmiss = rowmiss(`dropna')
+ 29.         quietly drop if __rowmiss > 0
+ 30.         capture drop __rowmiss
+ 31.         display "  [prepare_panel] 剔除不完整观测后 N = " _N
+ 32.     }
+ 33. 
+.     * (d) 中心化  (e) 交互项（一律用中心化变量相乘：Aiken & West, 1991）
+.     if "`nocenter'" == "" {
+ 34.         foreach v of global center_vars {
+ 35.             capture drop `v'_c
+ 36.             quietly egen __m = mean(`v')
+ 37.             quietly gen `v'_c = `v' - __m
+ 38.             capture drop __m
+ 39.         }
+ 40.         foreach v of global interaction_vars {
+ 41.             capture drop `v'
+ 42.         }
+ 43.         quietly gen subsidy_rd  = subsidy_c * rd_c
+ 44.         quietly gen subsidy_rd2 = subsidy_c * rd_c^2
+ 45.         quietly gen subsidy_lev = subsidy_c * lev_c
+ 46.         quietly gen rd_lev      = rd_c * lev_c
+ 47.         quietly gen salesq_sub  = salesq_c * subsidy_c
+ 48.         * 交互项自身再中心化（供需要 *_c 版交互项的模型使用）
+.         foreach v of global interaction_vars {
+ 49.             capture drop `v'_c
+ 50.             quietly egen __m = mean(`v')
+ 51.             quietly gen `v'_c = `v' - __m
+ 52.             capture drop __m
+ 53.         }
+ 54.         display "  [prepare_panel] 已完成中心化与交互项构建"
+ 55.     }
+ 56. end
+
+. 
+. *==============================================================================
+. * 工具程序 2：show_models —— 输出已存储模型的对比表
+. *   有 esttab 时输出 rtf 表 + 屏幕表；没有时退回 estimates table
+. *==============================================================================
+. capture program drop show_models
+
+. program define show_models
+  1.     syntax anything [, TItle(string) FIle(string) MTitles(string) KEEP(string)]
+  2.     local mtopt ""
+  3.     if "`mtitles'" != "" local mtopt `"mtitles(`mtitles')"'
+  4.     local keepopt ""
+  5.     if "`keep'" != "" local keepopt "keep(`keep')"
+  6.     display _n(2) "=============== 表：`title' ==============="
+  7.     if "$have_esttab" == "1" {
+  8.         if "`file'" != "" {
+  9.             esttab `anything' using "`file'", replace b(4) se(4) ///
+>                 star(* 0.1 ** 0.05 *** 0.01) nogap compress title("`title'") ///
+>                 `mtopt' `keepopt'
+ 10.         }
+ 11.         else {
+ 12.             esttab `anything', b(4) se(4) star(* 0.1 ** 0.05 *** 0.01) ///
+>                 nogap compress title("`title'") `mtopt' `keepopt'
+ 13.         }
+ 14.     }
+ 15.     else {
+ 16.         estimates table `anything', b(%9.4f) star(0.10 0.05 0.01) ///
+>             stats(N r2_w r2_o F) `keepopt'
+ 17.     }
+ 18. end
+
+. 
+. *==============================================================================
+. * 工具程序 3：vif_table —— 计算方差膨胀因子
+. *   VIF_j = 1/(1-R²_j)，R²_j 来自"把第 j 个解释变量对其余解释变量回归"；
+. *   所有辅助回归都限制在"全部变量均不缺失"的同一样本上，
+. *   与 notebook 中 variance_inflation_factor 在同一个 .dropna() 矩阵上的算法等价。
+. *==============================================================================
+. capture program drop vif_table
+
+. program define vif_table
+  1.     local all `*'
+  2.     quietly egen __okrow = rowmiss(`all')
+  3.     quietly count if __okrow == 0
+  4.     display "  （VIF 计算样本：N = " r(N) "）"
+  5.     display "  变量              VIF        1/VIF      判断"
+  6.     foreach x of local all {
+  7.         local others : list all - x
+  8.         quietly regress `x' `others' if __okrow == 0
+  9.         scalar __vif = 1/(1 - e(r2))
+ 10.         local flag "无共线性"
+ 11.         if __vif >= 5  local flag "中度共线"
+ 12.         if __vif >= 10 local flag "严重共线"
+ 13.         display "  " %-14s "`x'" %9.3f scalar(__vif) %11.3f scalar(1/__vif) "      `flag'"
+ 14.     }
+ 15.     capture drop __okrow
+ 16. end
+
+. 
+. *==============================================================================
+. * 第一部分：数据导入与描述（notebook cell 2–7）
+. *==============================================================================
+. display _n(2) "=================================================="
+
+
+==================================================
+
+. display "第一部分：数据导入与描述统计"
+第一部分：数据导入与描述统计
+
+. display "=================================================="
+==================================================
+
+. 
+. capture frame drop raw
+
+. frame create raw
+
+. frame change raw
+
+. import delimited using "`data_path'/新面板数据.csv", clear encoding("utf-8") varnames(1)
+(20 vars, 529 obs)
+
+. sort code year quarter
+
+. 
+. * 列集合（对应 notebook cell 5）：headers4 = 前 11 个变量
+. local headers4 "tobinq subsidy rd soe lev cf salesq roa roe gm bm"
+
+. display _n "描述性统计（对应 cell 6）："
+
+描述性统计（对应 cell 6）：
+
+. summarize `headers4'
+
+    Variable |        Obs        Mean    Std. dev.       Min        Max
+-------------+---------------------------------------------------------
+      tobinq |        511    2.079349    2.113286    .737422   17.57311
+     subsidy |        474    .0127242    .0171414    -.00622    .165219
+          rd |        517     .061661    .0562558    .002561    .458178
+         soe |        529    .5746692     .494861          0          1
+         lev |        516    .6512928    .1467592    .180618   1.172138
+-------------+---------------------------------------------------------
+          cf |        495    .0154821    .0513571   -.250575    .217902
+      salesq |        517    323.4378    529.0389       2.31    2748.51
+         roa |        516   -.0036137    .0294645   -.336238    .074359
+         roe |        516   -.0267964    .1965815  -1.968207   1.953304
+          gm |        517      .11165    .1005902   -.810822    .314372
+-------------+---------------------------------------------------------
+          bm |        511    .5086116    .4403453   -.346622   3.226086
+
+. 
+. display _n "相关系数矩阵（对应 cell 7 的相关系数热力图）："
+
+相关系数矩阵（对应 cell 7 的相关系数热力图）：
+
+. pwcorr `headers4', star(0.05)
+
+             |   tobinq  subsidy       rd      soe      lev       cf   salesq
+-------------+---------------------------------------------------------------
+      tobinq |   1.0000 
+     subsidy |  -0.1508*  1.0000 
+          rd |   0.1248*  0.0775   1.0000 
+         soe |  -0.4273*  0.1029* -0.3974*  1.0000 
+         lev |  -0.3047*  0.0469  -0.0193   0.1114*  1.0000 
+          cf |   0.1461* -0.1491* -0.1818* -0.1408* -0.0123   1.0000 
+      salesq |   0.3106* -0.1597* -0.1401* -0.1812* -0.1665*  0.1552*  1.0000 
+         roa |   0.1517* -0.0170  -0.5881*  0.0881* -0.3138*  0.2789*  0.2588*
+         roe |   0.0503  -0.0309  -0.0901*  0.0141  -0.2000* -0.0428   0.1440*
+          gm |   0.2792* -0.0881  -0.3215* -0.2534* -0.2305*  0.2956*  0.2625*
+          bm |  -0.4201* -0.0371  -0.3064*  0.5142* -0.1995* -0.1114*  0.2498*
+
+             |      roa      roe       gm       bm
+-------------+------------------------------------
+         roa |   1.0000 
+         roe |   0.1939*  1.0000 
+          gm |   0.6538*  0.1673*  1.0000 
+          bm |   0.1610*  0.1592* -0.1172*  1.0000 
+
+. 
+. *==============================================================================
+. * 第二部分：数据预处理与交互项（notebook cell 8–9）
+. *==============================================================================
+. display _n(2) "=================================================="
+
+
+==================================================
+
+. display "第二部分：数据预处理与交互项构建"
+第二部分：数据预处理与交互项构建
+
+. display "=================================================="
+==================================================
+
+. 
+. capture frame drop main
+
+. frame copy raw main
+
+. frame change main
+
+. 
+. * (1) 时间标识：Quarter 形如 '2020Q4'，取末位季度数字
+. gen qnum = real(substr(quarter, strlen(quarter), 1))
+
+. assert !missing(qnum)
+
+. label variable qnum "季度(1-4)"
+
+. * (2) 时间序号：2021Q1 = 1、2021Q2 = 2 ……（与 notebook 完全一致）
+. gen time = (year - 2021) * 4 + qnum
+
+. label variable time "时间序号(2021Q1=1)"
+
+. sort code time
+
+. 
+. * (3) 面板设定：Stata 的面板 id 必须数值型，字符串企业代码需先转数值
+. egen panel_id = group(code)
+
+. label variable panel_id "企业(数值面板id)"
+
+. xtset panel_id time
+
+Panel variable: panel_id (unbalanced)
+ Time variable: time, 0 to 23, but with gaps
+         Delta: 1 unit
+
+. xtdes
+
+panel_id:  1, 2, ..., 23                                     n =         23
+    time:  0, 1, ..., 23                                     T =         24
+           Delta(time) = 1 unit
+           Span(time)  = 24 periods
+           (panel_id*time uniquely identifies each observation)
+
+Distribution of T_i:   min      5%     25%       50%       75%     95%     max
+                        11      23      23        24        24      24      24
+
+     Freq.  Percent    Cum. |  Pattern
+ ---------------------------+--------------------------
+       12     52.17   52.17 |  111111111111111111111111
+       10     43.48   95.65 |  11111111111111111111111.
+        1      4.35  100.00 |  1.1.1.1.1.1.1.1.1.1.1...
+ ---------------------------+--------------------------
+       23    100.00         |  XXXXXXXXXXXXXXXXXXXXXXXX
+
+. 
+. * (4) 主样本第一步：只缩尾（样本尚未定下来，暂不中心化）
+. prepare_panel, winsor
+  [prepare_panel] 已完成 1%/99% 缩尾（只对非缺失值）
+  [prepare_panel] 已完成中心化与交互项构建
+
+. quietly summarize tobinq
+
+. display "  自检 TobinQ: min = " %8.4f r(min) "  max = " %8.4f r(max)
+  自检 TobinQ: min =   0.8059  max =  12.3975
+
+. 
+. * 产权性质分布（对应 cell 9 的企业分类说明）
+. tab soe
+
+        SOE |      Freq.     Percent        Cum.
+------------+-----------------------------------
+          0 |        225       42.53       42.53
+          1 |        304       57.47      100.00
+------------+-----------------------------------
+      Total |        529      100.00
+
+. 
+. *==============================================================================
+. * 第三部分：共线性 / 内生性 / 异方差诊断（notebook cell 11–14）
+. *==============================================================================
+. display _n(2) "=================================================="
+
+
+==================================================
+
+. display "第三部分：共线性、内生性、异方差诊断"
+第三部分：共线性、内生性、异方差诊断
+
+. display "=================================================="
+==================================================
+
+. 
+. * --- 3.1 VIF（cell 12）-------------------------------------------------------
+. * 说明：VIF 只取决于解释变量与样本。notebook 先把解释变量矩阵 .dropna() 再算 VIF，
+. *       这里对同一个"解释变量全不缺失"的样本逐变量计算 1/(1-R²)，口径完全一致。
+. display _n "【表1】VIF —— 集合：subsidy rd soe lev cf salesq roa roe gm bm"
+
+【表1】VIF —— 集合：subsidy rd soe lev cf salesq roa roe gm bm
+
+. vif_table subsidy rd soe lev cf salesq roa roe gm bm
+  （VIF 计算样本：N = 467）
+  变量              VIF        1/VIF      判断
+  subsidy           1.088      0.919      无共线性
+  rd                1.732      0.578      无共线性
+  soe               1.959      0.510      无共线性
+  lev               1.422      0.703      无共线性
+  cf                1.139      0.878      无共线性
+  salesq            1.426      0.701      无共线性
+  roa               3.540      0.282      无共线性
+  roe               2.213      0.452      无共线性
+  gm                2.246      0.445      无共线性
+  bm                1.840      0.543      无共线性
+
+. 
+. display _n "【表2】VIF —— 集合：subsidy rd cf salesq bm gm roa roe"
+
+【表2】VIF —— 集合：subsidy rd cf salesq bm gm roa roe
+
+. vif_table subsidy rd cf salesq bm gm roa roe
+  （VIF 计算样本：N = 467）
+  变量              VIF        1/VIF      判断
+  subsidy           1.081      0.925      无共线性
+  rd                1.489      0.671      无共线性
+  cf                1.131      0.885      无共线性
+  salesq            1.273      0.785      无共线性
+  bm                1.328      0.753      无共线性
+  gm                2.094      0.478      无共线性
+  roa               3.368      0.297      无共线性
+  roe               2.142      0.467      无共线性
+
+. display "判断标准：VIF < 5 无严重共线性；5–10 中度；> 10 严重"
+判断标准：VIF < 5 无严重共线性；5–10 中度；> 10 严重
+
+. 
+. * --- 3.2 DWH 内生性检验（cell 13）------------------------------------------
+. * 工具变量：subsidy 的滞后一期（按企业取上一行，等价 pandas shift(1)）
+. display _n "【DWH 检验】工具变量：subsidy_lag1（滞后一期补贴）"
+
+【DWH 检验】工具变量：subsidy_lag1（滞后一期补贴）
+
+. bysort panel_id (time): gen subsidy_lag1 = subsidy[_n-1]
+(67 missing values generated)
+
+. label variable subsidy_lag1 "滞后一期补贴"
+
+. 
+. * OLS（企业固定效应），样本与 IV 完全一致才可比
+. xtreg tobinq subsidy rd lev cf if !missing(subsidy_lag1), fe
+
+Fixed-effects (within) regression               Number of obs     =        442
+Group variable: panel_id                        Number of groups  =         21
+
+R-squared:                                      Obs per group:
+     Within  = 0.0179                                         min =          5
+     Between = 0.1892                                         avg =       21.0
+     Overall = 0.1298                                         max =         22
+
+                                                F(4, 417)         =       1.90
+corr(u_i, Xb) = 0.3033                          Prob > F          =     0.1092
+
+------------------------------------------------------------------------------
+      tobinq | Coefficient  Std. err.      t    P>|t|     [95% conf. interval]
+-------------+----------------------------------------------------------------
+     subsidy |  -4.048398   2.923623    -1.38   0.167    -9.795273    1.698477
+          rd |  -.0388292   1.817592    -0.02   0.983    -3.611614    3.533955
+         lev |  -1.093658   .5624263    -1.94   0.053    -2.199202    .0118862
+          cf |   1.062679   .8519275     1.25   0.213    -.6119291    2.737286
+       _cons |   2.723943   .3915366     6.96   0.000     1.954311    3.493574
+-------------+----------------------------------------------------------------
+     sigma_u |  1.7054373
+     sigma_e |  .75138739
+         rho |  .83744117   (fraction of variance due to u_i)
+------------------------------------------------------------------------------
+F test that all u_i=0: F(20, 417) = 99.37                    Prob > F = 0.0000
+
+. scalar ols_coef = _b[subsidy]
+
+. scalar ols_p    = 2 * ttail(e(df_r), abs(_b[subsidy]/_se[subsidy]))
+
+. estimates store dwh_ols
+
+. 
+. * IV(2SLS)（企业固定效应；对应 notebook 的 LSDV 实体固定效应 IV）
+. xtivreg tobinq rd lev cf (subsidy = subsidy_lag1) if !missing(subsidy_lag1), fe
+
+Fixed-effects (within) IV regression            Number of obs     =        442
+Group variable: panel_id                        Number of groups  =         21
+
+R-squared:                                      Obs per group:
+     Within  =      .                                         min =          5
+     Between = 0.1071                                         avg =       21.0
+     Overall = 0.0345                                         max =         22
+
+                                                Wald chi2(4)      =     198.33
+corr(u_i, Xb) = -0.2854                         Prob > chi2       =     0.0000
+
+------------------------------------------------------------------------------
+      tobinq | Coefficient  Std. err.      z    P>|z|     [95% conf. interval]
+-------------+----------------------------------------------------------------
+     subsidy |  -230.2566   826.2319    -0.28   0.780    -1849.641    1389.128
+          rd |   26.50371   97.19939     0.27   0.785    -164.0036     217.011
+         lev |   1.810424    10.8328     0.17   0.867    -19.42147    23.04231
+          cf |  -6.550346   28.00383    -0.23   0.815    -61.43684    48.33614
+       _cons |   2.363725   2.021102     1.17   0.242    -1.597563    6.325014
+-------------+----------------------------------------------------------------
+     sigma_u |  2.0568739
+     sigma_e |  2.9444556
+         rho |  .32794963   (fraction of variance due to u_i)
+------------------------------------------------------------------------------
+ F test that all u_i=0: F(20,417) =     6.03              Prob > F    = 0.0000
+------------------------------------------------------------------------------
+Endogenous: subsidy
+Exogenous:  rd lev cf subsidy_lag1
+
+. scalar iv_coef = _b[subsidy]
+
+. scalar iv_t    = _b[subsidy]/_se[subsidy]
+
+. scalar iv_p    = .
+
+. capture scalar iv_p = 2 * ttail(e(df_r), abs(iv_t))
+
+. if missing(iv_p) scalar iv_p = 2 * normal(-abs(iv_t))
+
+. estimates store dwh_iv
+
+. 
+. display "  OLS  subsidy 系数 = " %9.4f scalar(ols_coef) "  (p = " %6.4f scalar(ols_p) ")"
+  OLS  subsidy 系数 =   -4.0484  (p = 0.1669)
+
+. display "  IV   subsidy 系数 = " %9.4f scalar(iv_coef)  "  (p = " %6.4f scalar(iv_p)  ")"
+  IV   subsidy 系数 = -230.2566  (p = 0.7805)
+
+. display "  OLS 与 IV 系数差异 = " %9.4f scalar(abs(iv_coef - ols_coef))
+  OLS 与 IV 系数差异 =  226.2082
+
+. if abs(iv_coef - ols_coef) > abs(ols_coef) * 0.3 {
+.     display "  !! 系数差异较大，提示可能存在内生性问题，建议使用 IV 估计"
+  !! 系数差异较大，提示可能存在内生性问题，建议使用 IV 估计
+. }
+
+. else {
+.     display "  OK 系数差异较小，内生性问题不严重"
+. }
+
+. show_models dwh_ols dwh_iv, title("DWH：OLS vs IV") ///
+>     mtitles("OLS(FE)" "IV(FE)") file("表_dwh_ols_iv.rtf")
+
+
+=============== 表：DWH：OLS vs IV ===============
+(output written to 表_dwh_ols_iv.rtf)
+
+. 
+. * --- 3.3 异方差检验（cell 14）----------------------------------------------
+. display _n "【异方差检验】混合 OLS 残差"
+
+【异方差检验】混合 OLS 残差
+
+. regress tobinq subsidy rd lev cf
+
+      Source |       SS           df       MS      Number of obs   =       467
+-------------+----------------------------------   F(4, 462)       =     21.41
+       Model |  273.483961         4  68.3709904   Prob > F        =    0.0000
+    Residual |  1475.15407       462  3.19297417   R-squared       =    0.1564
+-------------+----------------------------------   Adj R-squared   =    0.1491
+       Total |  1748.63803       466  3.75244212   Root MSE        =    1.7869
+
+------------------------------------------------------------------------------
+      tobinq | Coefficient  Std. err.      t    P>|t|     [95% conf. interval]
+-------------+----------------------------------------------------------------
+     subsidy |  -20.82676   6.065388    -3.43   0.001    -32.74592   -8.907589
+          rd |   6.623871   1.980396     3.34   0.001      2.73217    10.51557
+         lev |  -4.127754   .6141895    -6.72   0.000    -5.334705   -2.920803
+          cf |   5.908785   1.775175     3.33   0.001     2.420367    9.397202
+       _cons |    4.50155    .431506    10.43   0.000     3.653592    5.349507
+------------------------------------------------------------------------------
+
+. display "Breusch-Pagan 检验（Stata 的 estat hettest 报的是 Cook–Weisberg 变体）："
+Breusch-Pagan 检验（Stata 的 estat hettest 报的是 Cook–Weisberg 变体）：
+
+. estat hettest, rhs
+
+Breusch–Pagan/Cook–Weisberg test for heteroskedasticity 
+Assumption: Normal error terms
+Variables: All independent variables
+
+H0: Constant variance
+
+    chi2(4) = 347.21
+Prob > chi2 = 0.0000
+
+. display "White 检验："
+White 检验：
+
+. estat imtest, white
+
+White's test
+H0: Homoskedasticity
+Ha: Unrestricted heteroskedasticity
+
+   chi2(14) = 123.99
+Prob > chi2 = 0.0000
+
+Cameron & Trivedi's decomposition of IM-test
+
+--------------------------------------------------
+              Source |       chi2     df         p
+---------------------+----------------------------
+  Heteroskedasticity |     123.99     14    0.0000
+            Skewness |      58.15      4    0.0000
+            Kurtosis |      12.76      1    0.0004
+---------------------+----------------------------
+               Total |     194.90     19    0.0000
+--------------------------------------------------
+
+. display "经典 Breusch-Pagan LM（= N·R²，与 notebook 的 het_breuschpagan 完全同口径）："
+经典 Breusch-Pagan LM（= N·R²，与 notebook 的 het_breuschpagan 完全同口径）：
+
+. quietly regress tobinq subsidy rd lev cf
+
+. quietly predict __e, resid
+
+. quietly gen __e2 = __e^2
+
+. quietly regress __e2 subsidy rd lev cf
+
+. scalar lm_bp = e(N) * e(r2)
+
+. display "  LM = " %9.4f scalar(lm_bp) "   p = " %9.6f scalar(chi2tail(4, lm_bp))
+  LM =   49.0021   p =  0.000000
+
+. quietly drop __e __e2
+
+. display "注：对应 notebook 的 het_breuschpagan / het_white；"
+注：对应 notebook 的 het_breuschpagan / het_white；
+
+. display "    因检验显示存在异方差，后续回归统一使用企业层面聚类稳健标准误。"
+    因检验显示存在异方差，后续回归统一使用企业层面聚类稳健标准误。
+
+. 
+. *==============================================================================
+. * 第四部分：主成分分析（notebook cell 15–25；按要求跳过 cell 50）
+. *==============================================================================
+. display _n(2) "=================================================="
+
+
+==================================================
+
+. display "第四部分：主成分分析（PCA）"
+第四部分：主成分分析（PCA）
+
+. display "=================================================="
+==================================================
+
+. 
+. capture frame drop withtsla
+
+. frame copy main withtsla
+
+. frame change withtsla
+
+. 
+. * --- 4.1 缺失情况（cell 18）------------------------------------------------
+. display _n "【4.1】缺失值情况"
+
+【4.1】缺失值情况
+
+. misstable summarize
+                                                               Obs<.
+                                                +------------------------------
+               |                                | Unique
+      Variable |     Obs=.     Obs>.     Obs<.  | values        Min         Max
+  -------------+--------------------------------+------------------------------
+        tobinq |        18                 511  |   >500     .80593    12.39748
+       subsidy |        55                 474  |    434          0     .086904
+            rd |        12                 517  |   >500    .010346     .269998
+           lev |        13                 516  |   >500    .301944     .990698
+            cf |        34                 495  |    485   -.140112     .155445
+        salesq |        12                 517  |   >500       3.85     2166.54
+           roa |        13                 516  |   >500   -.109453     .044779
+           roe |        13                 516  |   >500   -.752236     .142707
+            gm |        12                 517  |   >500   -.187251     .286663
+            bm |        18                 511  |   >500    .015465    2.065096
+     subsidy_c |        55                 474  |    434  -.0122864    .0746176
+          rd_c |        12                 517  |   >500  -.0504483    .2092037
+         lev_c |        13                 516  |   >500  -.3485644    .3401896
+          cf_c |        34                 495  |    485  -.1558929    .1396641
+      salesq_c |        12                 517  |   >500  -317.2517    1845.438
+         roa_c |        13                 516  |   >500  -.1064157    .0478163
+          gm_c |        12                 517  |   >500  -.3018413    .1720727
+         roe_c |        13                 516  |   >500  -.7244796    .1704634
+          bm_c |        18                 511  |   >500  -.4925596    1.557071
+    subsidy_rd |        56                 473  |    473  -.0032132    .0065673
+   subsidy_rd2 |        56                 473  |    473  -.0003827    .0010842
+   subsidy_lev |        57                 472  |    472  -.0110253    .0217991
+        rd_lev |        13                 516  |   >500  -.0588745    .0711689
+    salesq_sub |        56                 473  |    473  -23.67257    14.76282
+  subsidy_rd_c |        56                 473  |    473  -.0032693    .0065112
+  subsidy_~2_c |        56                 473  |    473  -.0003821    .0010848
+  subsidy_le~c |        57                 472  |    472  -.0111632    .0216612
+      rd_lev_c |        13                 516  |   >500  -.0584993    .0715441
+  salesq_sub_c |        56                 473  |    473  -22.28757    16.14781
+  subsidy_lag1 |        67                 462  |    424          0     .086904
+  -----------------------------------------------------------------------------
+
+. 
+. * --- 4.2 预处理（cell 19）：插值 -> 剔除不完整 -> 中心化 -> 交互项 ----------
+. * notebook 在此构造 df_pca（含 TSLA 的全样本），它随后成为全篇的分析样本 panel_df
+. local num_cols "year qnum time tobinq subsidy rd soe lev cf salesq roa roe gm bm"
+
+. local imp_cols "subsidy rd soe lev cf salesq roa roe gm bm"
+
+. prepare_panel, impute(`imp_cols') dropna(`num_cols')
+  [prepare_panel] 已完成企业内线性插值（TobinQ 与被解释变量除外）
+  [prepare_panel] 剔除不完整观测后 N = 481
+  [prepare_panel] 已完成中心化与交互项构建
+
+. sort panel_id time
+
+. display "  数据形状：N = " _N
+  数据形状：N = 481
+
+. quietly summarize subsidy_c
+
+. display "  自检 Subsidy_c 均值 = " %12.3e r(mean) " （中心化后应接近 0）"
+  自检 Subsidy_c 均值 =   -5.809e-12 （中心化后应接近 0）
+
+. 
+. * --- 4.3 KMO 与 Bartlett 球形检验（cell 22）--------------------------------
+. local pca_features "subsidy rd lev cf roa gm salesq roe"
+
+. display _n "【4.3】PCA 前置检验"
+
+【4.3】PCA 前置检验
+
+. display "KMO 抽样充分性检验（> 0.6 适合做 PCA）："
+KMO 抽样充分性检验（> 0.6 适合做 PCA）：
+
+. factor `pca_features', pcf
+(obs=481)
+
+Factor analysis/correlation                      Number of obs    =        481
+    Method: principal-component factors          Retained factors =          3
+    Rotation: (unrotated)                        Number of params =         21
+
+    --------------------------------------------------------------------------
+         Factor  |   Eigenvalue   Difference        Proportion   Cumulative
+    -------------+------------------------------------------------------------
+        Factor1  |      2.83261      1.60494            0.3541       0.3541
+        Factor2  |      1.22767      0.11499            0.1535       0.5075
+        Factor3  |      1.11268      0.24412            0.1391       0.6466
+        Factor4  |      0.86856      0.10006            0.1086       0.7552
+        Factor5  |      0.76850      0.16182            0.0961       0.8513
+        Factor6  |      0.60669      0.21417            0.0758       0.9271
+        Factor7  |      0.39251      0.20174            0.0491       0.9762
+        Factor8  |      0.19078            .            0.0238       1.0000
+    --------------------------------------------------------------------------
+    LR test: independent vs. saturated:  chi2(28) = 1023.15 Prob>chi2 = 0.0000
+
+Factor loadings (pattern matrix) and unique variances
+
+    -----------------------------------------------------------
+        Variable |  Factor1   Factor2   Factor3 |   Uniqueness 
+    -------------+------------------------------+--------------
+         subsidy |  -0.2578   -0.4114   -0.5559 |      0.4553  
+              rd |  -0.3985   -0.5084    0.6058 |      0.2157  
+             lev |  -0.4678    0.6400   -0.2912 |      0.2867  
+              cf |   0.3268    0.5618    0.3125 |      0.4799  
+             roa |   0.8903   -0.0307   -0.2814 |      0.1272  
+              gm |   0.7685   -0.0247    0.0933 |      0.4001  
+          salesq |   0.5093    0.1042    0.3641 |      0.5972  
+             roe |   0.7995   -0.2496   -0.1836 |      0.2648  
+    -----------------------------------------------------------
+
+. estat kmo
+
+Kaiser-Meyer-Olkin measure of sampling adequacy
+
+    -----------------------
+        Variable |     kmo 
+    -------------+---------
+         subsidy |  0.5885 
+              rd |  0.4142 
+             lev |  0.6407 
+              cf |  0.7318 
+             roa |  0.6288 
+              gm |  0.6993 
+          salesq |  0.8584 
+             roe |  0.7778 
+    -------------+---------
+         Overall |  0.6637 
+    -----------------------
+
+. 
+. display _n "Bartlett 球形检验（H0：相关矩阵为单位阵）："
+
+Bartlett 球形检验（H0：相关矩阵为单位阵）：
+
+. pca `pca_features'
+
+Principal components/correlation                 Number of obs    =        481
+                                                 Number of comp.  =          8
+                                                 Trace            =          8
+    Rotation: (unrotated = principal)            Rho              =     1.0000
+
+    --------------------------------------------------------------------------
+       Component |   Eigenvalue   Difference         Proportion   Cumulative
+    -------------+------------------------------------------------------------
+           Comp1 |      2.83261      1.60494             0.3541       0.3541
+           Comp2 |      1.22767      .114988             0.1535       0.5075
+           Comp3 |      1.11268      .244117             0.1391       0.6466
+           Comp4 |      .868563       .10006             0.1086       0.7552
+           Comp5 |      .768503      .161815             0.0961       0.8513
+           Comp6 |      .606687      .214175             0.0758       0.9271
+           Comp7 |      .392513      .201736             0.0491       0.9762
+           Comp8 |      .190776            .             0.0238       1.0000
+    --------------------------------------------------------------------------
+
+Principal components (eigenvectors) 
+
+    ------------------------------------------------------------------------------------------------------------
+        Variable |    Comp1     Comp2     Comp3     Comp4     Comp5     Comp6     Comp7     Comp8 | Unexplained 
+    -------------+--------------------------------------------------------------------------------+-------------
+         subsidy |  -0.1532   -0.3713   -0.5270    0.5748    0.4380   -0.1778   -0.0421   -0.0731 |           0 
+              rd |  -0.2368   -0.4588    0.5743    0.3464   -0.0262    0.3151    0.2791    0.3251 |           0 
+             lev |  -0.2779    0.5776   -0.2761    0.1327    0.1695    0.5663    0.3658    0.1098 |           0 
+              cf |   0.1942    0.5071    0.2963    0.6294   -0.1415   -0.4399    0.0878    0.0025 |           0 
+             roa |   0.5290   -0.0277   -0.2668    0.0218   -0.0391    0.0558   -0.0717    0.7987 |           0 
+              gm |   0.4566   -0.0223    0.0885    0.3076   -0.0218    0.5894   -0.4554   -0.3652 |           0 
+          salesq |   0.3026    0.0941    0.3451   -0.2016    0.8487   -0.0623    0.1240   -0.0194 |           0 
+             roe |   0.4750   -0.2253   -0.1741   -0.0131   -0.1910    0.0218    0.7422   -0.3244 |           0 
+    ------------------------------------------------------------------------------------------------------------
+
+. matrix C = e(C)
+
+. scalar b_n = e(N)
+
+. local  b_p : word count `pca_features'
+
+. scalar b_chi2 = -(b_n - 1 - (2*`b_p' + 5)/6) * ln(det(C))
+
+. scalar b_df   = `b_p' * (`b_p' - 1)/2
+
+. display "  χ² = " %9.2f scalar(b_chi2) "   df = " scalar(b_df) ///
+>         "   p = " %9.6f scalar(chi2tail(b_df, b_chi2))
+  χ² =   1021.01   df = 28   p =  0.000000
+
+. display "  （与 factor 的 LR test: independent vs. saturated 近似一致，仅常数项取法略有差异）"
+  （与 factor 的 LR test: independent vs. saturated 近似一致，仅常数项取法略有差异）
+
+. 
+. * --- 4.4 主成分个数与得分（cell 23/24）-------------------------------------
+. * 保留累计解释方差 >= 80% 的主成分，且限制在 [2, 5] 之间
+. matrix Ev = e(Ev)
+
+. scalar cum = 0
+
+. scalar ncomp = 0
+
+. forvalues j = 1/`b_p' {
+  2.     scalar cum = cum + Ev[1, `j']/`b_p'
+  3.     if (cum >= 0.80 & ncomp == 0) scalar ncomp = `j'
+  4. }
+
+. if ncomp < 2 scalar ncomp = 2
+
+. if ncomp > 5 scalar ncomp = 5
+
+. display _n "保留前 " scalar(ncomp) " 个主成分（累计解释方差 >= 80%）"
+
+保留前 5 个主成分（累计解释方差 >= 80%）
+
+. 
+. local pcnames ""
+
+. forvalues j = 1/`=ncomp' {
+  2.     capture drop pc`j'
+  3.     local pcnames "`pcnames' pc`j'"
+  4. }
+
+. pca `pca_features', components(`=ncomp')
+
+Principal components/correlation                 Number of obs    =        481
+                                                 Number of comp.  =          5
+                                                 Trace            =          8
+    Rotation: (unrotated = principal)            Rho              =     0.8513
+
+    --------------------------------------------------------------------------
+       Component |   Eigenvalue   Difference         Proportion   Cumulative
+    -------------+------------------------------------------------------------
+           Comp1 |      2.83261      1.60494             0.3541       0.3541
+           Comp2 |      1.22767      .114988             0.1535       0.5075
+           Comp3 |      1.11268      .244117             0.1391       0.6466
+           Comp4 |      .868563       .10006             0.1086       0.7552
+           Comp5 |      .768503      .161815             0.0961       0.8513
+           Comp6 |      .606687      .214175             0.0758       0.9271
+           Comp7 |      .392513      .201736             0.0491       0.9762
+           Comp8 |      .190776            .             0.0238       1.0000
+    --------------------------------------------------------------------------
+
+Principal components (eigenvectors) 
+
+    ------------------------------------------------------------------------------
+        Variable |    Comp1     Comp2     Comp3     Comp4     Comp5 | Unexplained 
+    -------------+--------------------------------------------------+-------------
+         subsidy |  -0.1532   -0.3713   -0.5270    0.5748    0.4380 |       .0209 
+              rd |  -0.2368   -0.4588    0.5743    0.3464   -0.0262 |        .111 
+             lev |  -0.2779    0.5776   -0.2761    0.1327    0.1695 |       .2494 
+              cf |   0.1942    0.5071    0.2963    0.6294   -0.1415 |       .1204 
+             roa |   0.5290   -0.0277   -0.2668    0.0218   -0.0391 |       .1256 
+              gm |   0.4566   -0.0223    0.0885    0.3076   -0.0218 |       .3176 
+          salesq |   0.3026    0.0941    0.3451   -0.2016    0.8487 |      .00846 
+             roe |   0.4750   -0.2253   -0.1741   -0.0131   -0.1910 |       .2366 
+    ------------------------------------------------------------------------------
+
+. predict `pcnames', score
+
+Scoring coefficients 
+    sum of squares(column-loading) = 1
+
+    ----------------------------------------------------------------
+        Variable |    Comp1     Comp2     Comp3     Comp4     Comp5 
+    -------------+--------------------------------------------------
+         subsidy |  -0.1532   -0.3713   -0.5270    0.5748    0.4380 
+              rd |  -0.2368   -0.4588    0.5743    0.3464   -0.0262 
+             lev |  -0.2779    0.5776   -0.2761    0.1327    0.1695 
+              cf |   0.1942    0.5071    0.2963    0.6294   -0.1415 
+             roa |   0.5290   -0.0277   -0.2668    0.0218   -0.0391 
+              gm |   0.4566   -0.0223    0.0885    0.3076   -0.0218 
+          salesq |   0.3026    0.0941    0.3451   -0.2016    0.8487 
+             roe |   0.4750   -0.2253   -0.1741   -0.0131   -0.1910 
+    ----------------------------------------------------------------
+
+. display "主成分得分描述统计："
+主成分得分描述统计：
+
+. summarize `pcnames'
+
+    Variable |        Obs        Mean    Std. dev.       Min        Max
+-------------+---------------------------------------------------------
+         pc1 |        481    6.83e-10    1.683036  -6.931479   3.861772
+         pc2 |        481   -3.58e-10    1.108001  -4.469975    3.58887
+         pc3 |        481    1.30e-09    1.054836  -3.662962    3.68325
+         pc4 |        481   -5.49e-10    .9319672  -2.389613   3.393818
+         pc5 |        481   -7.00e-10     .876643  -1.343028   2.874923
+
+. 
+. * --- 4.5 载荷矩阵（cell 24）-----------------------------------------------
+. * Stata 的 e(L) 是单位特征向量；notebook 展示的"载荷"是
+. *   载荷 = 单位特征向量 × √特征值（标准化数据下即变量与主成分的相关系数，取值 [-1,1]）
+. * 这里两者都给出。
+. display _n "【4.5】主成分载荷矩阵"
+
+【4.5】主成分载荷矩阵
+
+. display "单位特征向量（estat loadings）："
+单位特征向量（estat loadings）：
+
+. estat loadings
+
+Principal component loadings (unrotated)
+    component normalization: sum of squares(column) = 1
+
+    ----------------------------------------------------------------
+                 |    Comp1     Comp2     Comp3     Comp4     Comp5 
+    -------------+--------------------------------------------------
+         subsidy |   -.1532    -.3713     -.527     .5748      .438 
+              rd |   -.2368    -.4588     .5743     .3464   -.02625 
+             lev |   -.2779     .5776    -.2761     .1327     .1695 
+              cf |    .1942     .5071     .2963     .6294    -.1415 
+             roa |     .529   -.02769    -.2668    .02177   -.03906 
+              gm |    .4566   -.02231    .08847     .3076   -.02179 
+          salesq |    .3026    .09405     .3451    -.2016     .8487 
+             roe |     .475    -.2253    -.1741   -.01307     -.191 
+    ----------------------------------------------------------------
+
+. matrix Ev2 = e(Ev)
+
+. matrix L   = e(L)
+
+. * 载荷 = 单位特征向量 × √特征值（逐列缩放；这里只保留已提取的前 ncomp 个主成分）
+. local nkeep = colsof(L)
+
+. matrix D = J(`nkeep', `nkeep', 0)
+
+. forvalues j = 1/`nkeep' {
+  2.     matrix D[`j', `j'] = sqrt(Ev2[1, `j'])
+  3. }
+
+. matrix LOAD = L * D
+
+. display _n "载荷矩阵（变量与主成分的相关系数）："
+
+载荷矩阵（变量与主成分的相关系数）：
+
+. matrix list LOAD, format(%9.3f)
+
+LOAD[8,5]
+             c1      c2      c3      c4      c5
+subsidy  -0.258  -0.411  -0.556   0.536   0.384
+     rd  -0.398  -0.508   0.606   0.323  -0.023
+    lev  -0.468   0.640  -0.291   0.124   0.149
+     cf   0.327   0.562   0.313   0.587  -0.124
+    roa   0.890  -0.031  -0.281   0.020  -0.034
+     gm   0.768  -0.025   0.093   0.287  -0.019
+ salesq   0.509   0.104   0.364  -0.188   0.744
+    roe   0.799  -0.250  -0.184  -0.012  -0.167
+
+. display "注：|载荷| > 0.6 为该主成分的主要构成变量。"
+注：|载荷| > 0.6 为该主成分的主要构成变量。
+
+. display "注：主成分中 subsidy 与 rd 载荷符号相反是正交化约束的结果，"
+注：主成分中 subsidy 与 rd 载荷符号相反是正交化约束的结果，
+
+. display "    不代表经济上的替代关系。"
+    不代表经济上的替代关系。
+
+. quietly correlate subsidy rd
+
+. display "    两者实际相关系数 = " %6.3f r(rho)
+    两者实际相关系数 =  0.096
+
+. 
+. * --- 4.6 PCA 企业聚类散点图（cell 25，用 Stata 图形代替 matplotlib）--------
+. display _n "【4.6】PCA 企业财务特征聚类散点图"
+
+【4.6】PCA 企业财务特征聚类散点图
+
+. capture graph drop pca_scatter
+
+. twoway scatter pc2 pc1, mlabel(code) mlabsize(vsmall) ///
+>     msymbol(oh) mcolor(navy%60) ///
+>     xtitle("主成分1：盈利—规模 ↔ 研发密集") ///
+>     ytitle("主成分2：杠杆—补贴因子") ///
+>     title("新能源车企财务特征 PCA 聚类图") ///
+>     legend(off) graphregion(color(white))
+
+. capture graph export "图_pca企业聚类.png", replace width(1600)
+
+. 
+. *==============================================================================
+. * 第五部分：Lasso 变量筛选（notebook cell 31–33）
+. *==============================================================================
+. display _n(2) "=================================================="
+
+
+==================================================
+
+. display "第五部分：Lasso 变量筛选"
+第五部分：Lasso 变量筛选
+
+. display "=================================================="
+==================================================
+
+. 
+. * 组内去均值（消除企业固定效应）
+. * 对应 pandas: groupby("Code")[col].transform(lambda x: x - x.mean())
+. foreach v in tobinq subsidy rd lev cf salesq roa gm roe bm ///
+>              subsidy_rd subsidy_rd2 subsidy_lev rd_lev salesq_sub {
+  2.     capture drop `v'_dm
+  3.     quietly bysort panel_id: egen __m = mean(`v')
+  4.     quietly gen `v'_dm = `v' - __m
+  5.     capture drop __m
+  6. }
+
+. 
+. display _n "Lasso（5 折交叉验证，随机种子 42；对应 LassoCV(cv=5, random_state=42)）"
+
+Lasso（5 折交叉验证，随机种子 42；对应 LassoCV(cv=5, random_state=42)）
+
+. lasso linear tobinq_dm subsidy_dm rd_dm lev_dm cf_dm salesq_dm roa_dm gm_dm ///
+>     roe_dm bm_dm subsidy_rd_dm subsidy_rd2_dm subsidy_lev_dm rd_lev_dm ///
+>     salesq_sub_dm, selection(cv, folds(5)) rseed(42) nolog
+
+Lasso linear model                          No. of obs        =        481
+                                            No. of covariates =         14
+Selection: Cross-validation                 No. of CV folds   =          5
+
+--------------------------------------------------------------------------
+         |                                No. of      Out-of-      CV mean
+         |                               nonzero       sample   prediction
+      ID |     Description      lambda     coef.    R-squared        error
+---------+----------------------------------------------------------------
+       1 |    first lambda    .2667282         0       0.0055     .5803186
+      45 |   lambda before    .0044493        14       0.3061     .4048911
+    * 46 | selected lambda     .004054        14       0.3061     .4048882
+      47 |    lambda after    .0036939        14       0.3061     .4048956
+      63 |     last lambda    .0008337        14       0.3053     .4053609
+--------------------------------------------------------------------------
+* lambda selected by cross-validation.
+
+. 
+. display _n "Lasso 系数路径图："
+
+Lasso 系数路径图：
+
+. capture graph drop lasso_path
+
+. coefpath
+
+. capture graph export "图_lasso路径图.png", replace width(1600)
+
+. display _n "各变量系数（0 表示被 Lasso 剔除；对应 notebook 的 lasso_result 表）："
+
+各变量系数（0 表示被 Lasso 剔除；对应 notebook 的 lasso_result 表）：
+
+. lassocoef
+
+--------------------------
+               |  active  
+---------------+----------
+    subsidy_dm |     x    
+         rd_dm |     x    
+        lev_dm |     x    
+         cf_dm |     x    
+     salesq_dm |     x    
+        roa_dm |     x    
+         gm_dm |     x    
+        roe_dm |     x    
+         bm_dm |     x    
+ subsidy_rd_dm |     x    
+subsidy_rd2_dm |     x    
+subsidy_lev_dm |     x    
+     rd_lev_dm |     x    
+ salesq_sub_dm |     x    
+         _cons |     x    
+--------------------------
+Legend:
+  b - base level
+  e - empty cell
+  o - omitted
+  x - estimated
+
+. 
+. *==============================================================================
+. * 第六部分：工具变量法 2SLS（notebook cell 35–39）
+. *==============================================================================
+. display _n(2) "=================================================="
+
+
+==================================================
+
+. display "第六部分：工具变量法 2SLS"
+第六部分：工具变量法 2SLS
+
+. display "=================================================="
+==================================================
+
+. 
+. * 滞后工具变量：notebook 的 IV 部分（cell 36/37/38）是从"已插值的 df_pca/panel_df"
+. * 重新计算滞后项的，因此这里必须在当前（已插值）样本上重建 lag；
+. * 不能沿用第三部分基于"未插值"数据算出来的 lag（那样会导致样本与系数不一致）。
+. capture drop subsidy_lag1
+
+. capture drop rd_lag1
+
+. bysort panel_id (time): gen subsidy_lag1 = subsidy[_n-1]
+(22 missing values generated)
+
+. bysort panel_id (time): gen rd_lag1 = rd[_n-1]
+(22 missing values generated)
+
+. label variable subsidy_lag1 "滞后一期补贴"
+
+. label variable rd_lag1      "滞后一期研发"
+
+. 
+. * --- 6.1 第一阶段（cell 36/37）：弱工具变量检验 ----------------------------
+. display _n "【第一阶段】只含 subsidy_lag1："
+
+【第一阶段】只含 subsidy_lag1：
+
+. regress subsidy subsidy_lag1 rd lev cf salesq roa gm roe bm
+
+      Source |       SS           df       MS      Number of obs   =       459
+-------------+----------------------------------   F(9, 449)       =      6.72
+       Model |  .010560248         9  .001173361   Prob > F        =    0.0000
+    Residual |  .078426815       449   .00017467   R-squared       =    0.1187
+-------------+----------------------------------   Adj R-squared   =    0.1010
+       Total |  .088987063       458  .000194295   Root MSE        =    .01322
+
+------------------------------------------------------------------------------
+     subsidy | Coefficient  Std. err.      t    P>|t|     [95% conf. interval]
+-------------+----------------------------------------------------------------
+subsidy_lag1 |    .200813   .0458883     4.38   0.000     .1106306    .2909955
+          rd |   .0496282   .0186936     2.65   0.008     .0128904     .086366
+         lev |    .009085   .0054455     1.67   0.096    -.0016169    .0197869
+          cf |    -.03633   .0139836    -2.60   0.010    -.0638114   -.0088486
+      salesq |  -2.77e-06   1.30e-06    -2.14   0.033    -5.32e-06   -2.26e-07
+         roa |   .1451214   .0572338     2.54   0.012     .0326419    .2576008
+          gm |  -.0251637   .0112559    -2.24   0.026    -.0472844    -.003043
+         roe |  -.0007552   .0078488    -0.10   0.923    -.0161801    .0146697
+          bm |  -.0000316   .0016836    -0.02   0.985    -.0033403    .0032771
+       _cons |    .005676    .004574     1.24   0.215    -.0033131    .0146652
+------------------------------------------------------------------------------
+
+. test subsidy_lag1 = 0
+
+ ( 1)  subsidy_lag1 = 0
+
+       F(  1,   449) =   19.15
+            Prob > F =    0.0000
+
+. display "  第一阶段工具变量 F = " %8.2f r(F) ///
+>         cond(r(F) > 10, "   （F>10，非弱工具变量）", "   （F<10，可能为弱工具变量）")
+  第一阶段工具变量 F =    19.15   （F>10，非弱工具变量）
+
+. 
+. display _n "【第一阶段】含 subsidy_lag1 与 rd_lag1："
+
+【第一阶段】含 subsidy_lag1 与 rd_lag1：
+
+. regress subsidy subsidy_lag1 rd_lag1 rd lev cf salesq roa gm roe bm
+
+      Source |       SS           df       MS      Number of obs   =       459
+-------------+----------------------------------   F(10, 448)      =      6.21
+       Model |     .010831        10    .0010831   Prob > F        =    0.0000
+    Residual |  .078156062       448  .000174455   R-squared       =    0.1217
+-------------+----------------------------------   Adj R-squared   =    0.1021
+       Total |  .088987063       458  .000194295   Root MSE        =    .01321
+
+------------------------------------------------------------------------------
+     subsidy | Coefficient  Std. err.      t    P>|t|     [95% conf. interval]
+-------------+----------------------------------------------------------------
+subsidy_lag1 |   .2083847   .0462611     4.50   0.000     .1174691    .2993004
+     rd_lag1 |  -.0325608   .0261367    -1.25   0.213    -.0839267     .018805
+          rd |   .0773277   .0290413     2.66   0.008     .0202536    .1344018
+         lev |   .0089318   .0054436     1.64   0.102    -.0017663    .0196299
+          cf |  -.0344827   .0140534    -2.45   0.015    -.0621015   -.0068638
+      salesq |  -2.75e-06   1.30e-06    -2.12   0.034    -5.30e-06   -2.05e-07
+         roa |   .1470641   .0572199     2.57   0.010     .0346113    .2595169
+          gm |  -.0263629   .0112901    -2.34   0.020    -.0485509   -.0041748
+         roe |  -.0010832   .0078484    -0.14   0.890    -.0165074    .0143409
+          bm |  -.0001949   .0016877    -0.12   0.908    -.0035116    .0031219
+       _cons |   .0061531   .0045872     1.34   0.180    -.0028621    .0151682
+------------------------------------------------------------------------------
+
+. test (subsidy_lag1 = 0) (rd_lag1 = 0)
+
+ ( 1)  subsidy_lag1 = 0
+ ( 2)  rd_lag1 = 0
+
+       F(  2,   448) =   10.36
+            Prob > F =    0.0000
+
+. display "  两工具变量联合 F = " %8.2f r(F) ///
+>         cond(r(F) > 10, "   （F>10，非弱工具变量）", "   （F<10，可能为弱工具变量）")
+  两工具变量联合 F =    10.36   （F>10，非弱工具变量）
+
+. 
+. * --- 6.2 第二阶段（cell 38）：2SLS 与 OLS/IV（固定效应）对比 ---------------
+. display _n "【第二阶段】2SLS 估计（混合 2SLS，稳健标准误）："
+
+【第二阶段】2SLS 估计（混合 2SLS，稳健标准误）：
+
+. ivregress 2sls tobinq rd lev cf salesq roa gm roe bm (subsidy = subsidy_lag1), vce(robust)
+
+Instrumental variables 2SLS regression            Number of obs   =        459
+                                                  Wald chi2(9)    =     200.14
+                                                  Prob > chi2     =     0.0000
+                                                  R-squared       =     0.4373
+                                                  Root MSE        =     1.4059
+
+------------------------------------------------------------------------------
+             |               Robust
+      tobinq | Coefficient  std. err.      z    P>|z|     [95% conf. interval]
+-------------+----------------------------------------------------------------
+     subsidy |  -64.52441   20.56421    -3.14   0.002    -104.8295    -24.2193
+          rd |  -.8366659   2.045158    -0.41   0.682    -4.845103    3.171771
+         lev |  -4.808676   .6756102    -7.12   0.000    -6.132848   -3.484504
+          cf |   -2.47513   1.377652    -1.80   0.072    -5.175279    .2250193
+      salesq |   .0013494   .0001922     7.02   0.000     .0009726    .0017261
+         roa |   6.457211   6.231036     1.04   0.300    -5.755394    18.66982
+          gm |  -.8849174   1.196254    -0.74   0.459    -3.229532    1.459698
+         roe |  -1.751362   .6612242    -2.65   0.008    -3.047338   -.4553866
+          bm |  -2.760383   .2179345   -12.67   0.000    -3.187527    -2.33324
+       _cons |   7.064565   .6753872    10.46   0.000     5.740831      8.3883
+------------------------------------------------------------------------------
+Endogenous: subsidy
+Exogenous:  rd lev cf salesq roa gm roe bm subsidy_lag1
+
+. estimates store iv_2sls
+
+. 
+. display _n "对比①：OLS（企业固定效应，聚类稳健标准误；样本与 IV 完全一致）"
+
+对比①：OLS（企业固定效应，聚类稳健标准误；样本与 IV 完全一致）
+
+. xtreg tobinq subsidy rd lev cf salesq roa gm roe bm ///
+>     if !missing(subsidy_lag1) & !missing(rd_lag1), fe vce(cluster panel_id)
+
+Fixed-effects (within) regression               Number of obs     =        459
+Group variable: panel_id                        Number of groups  =         22
+
+R-squared:                                      Obs per group:
+     Within  = 0.2482                                         min =          4
+     Between = 0.0046                                         avg =       20.9
+     Overall = 0.0161                                         max =         22
+
+                                                F(9, 21)          =       2.63
+corr(u_i, Xb) = -0.4190                         Prob > F          =     0.0324
+
+                              (Std. err. adjusted for 22 clusters in panel_id)
+------------------------------------------------------------------------------
+             |               Robust
+      tobinq | Coefficient  std. err.      t    P>|t|     [95% conf. interval]
+-------------+----------------------------------------------------------------
+     subsidy |  -2.317224   1.561667    -1.48   0.153    -5.564889     .930441
+          rd |   1.598322   2.117399     0.75   0.459     -2.80505    6.001694
+         lev |   -1.53869     1.5332    -1.00   0.327    -4.727153    1.649774
+          cf |   1.435235   .5194881     2.76   0.012     .3549006     2.51557
+      salesq |  -.0013128   .0005859    -2.24   0.036    -.0025313   -.0000942
+         roa |  -1.486716   3.512288    -0.42   0.676    -8.790918    5.817486
+          gm |   1.171148   1.215447     0.96   0.346    -1.356512    3.698808
+         roe |  -.0459662   .4399054    -0.10   0.918    -.9607997    .8688672
+          bm |  -1.482311   .4669471    -3.17   0.005    -2.453381   -.5112414
+       _cons |   3.991018   1.174641     3.40   0.003     1.548218    6.433818
+-------------+----------------------------------------------------------------
+     sigma_u |  1.9230682
+     sigma_e |  .65962741
+         rho |    .894731   (fraction of variance due to u_i)
+------------------------------------------------------------------------------
+
+. estimates store iv_ols_fe
+
+. 
+. display _n "对比②：IV（企业固定效应，滞后补贴作工具变量）"
+
+对比②：IV（企业固定效应，滞后补贴作工具变量）
+
+. xtivreg tobinq rd lev cf salesq roa gm roe bm (subsidy = subsidy_lag1), fe
+
+Fixed-effects (within) IV regression            Number of obs     =        459
+Group variable: panel_id                        Number of groups  =         22
+
+R-squared:                                      Obs per group:
+     Within  =      .                                         min =          4
+     Between = 0.0415                                         avg =       20.9
+     Overall = 0.0196                                         max =         22
+
+                                                Wald chi2(9)      =     339.54
+corr(u_i, Xb) = -0.2559                         Prob > chi2       =     0.0000
+
+------------------------------------------------------------------------------
+      tobinq | Coefficient  Std. err.      z    P>|z|     [95% conf. interval]
+-------------+----------------------------------------------------------------
+     subsidy |  -184.4208   1617.196    -0.11   0.909    -3354.068    2985.226
+          rd |   22.24193   183.4137     0.12   0.903    -337.2423    381.7262
+         lev |   1.688308   28.71928     0.06   0.953    -54.60044    57.97706
+          cf |  -4.558334    53.2891    -0.09   0.932     -109.003    99.88638
+      salesq |  -.0010363   .0025427    -0.41   0.684    -.0060199    .0039474
+         roa |   29.01593   271.1084     0.11   0.915    -502.3468    560.3787
+          gm |   -5.93795   63.19946    -0.09   0.925    -129.8066    117.9307
+         roe |  -1.319342   11.40508    -0.12   0.908    -23.67289    21.03421
+          bm |  -.6957545    7.01441    -0.10   0.921    -14.44375    13.05224
+       _cons |    3.41771   5.282053     0.65   0.518    -6.934924    13.77034
+-------------+----------------------------------------------------------------
+     sigma_u |  1.9777016
+     sigma_e |  2.3341893
+         rho |  .41788578   (fraction of variance due to u_i)
+------------------------------------------------------------------------------
+ F test that all u_i=0: F(21,428) =     4.10              Prob > F    = 0.0000
+------------------------------------------------------------------------------
+Endogenous: subsidy
+Exogenous:  rd lev cf salesq roa gm roe bm subsidy_lag1
+
+. estimates store iv_xtivreg
+
+. 
+. show_models iv_ols_fe iv_2sls iv_xtivreg, ///
+>     title("OLS vs 2SLS vs IV(固定效应)") ///
+>     mtitles("OLS(FE)" "2SLS(混合)" "IV(FE)") keep(subsidy rd lev cf) ///
+>     file("表_iv_ols_iv.rtf")
+
+
+=============== 表：OLS vs 2SLS vs IV(固定效应) ===============
+(output written to 表_iv_ols_iv.rtf)
+
+. display "注：混合 2SLS 的第一阶段 F 只反映原始数据的相关性；固定效应 IV 还要看组内变异，"
+注：混合 2SLS 的第一阶段 F 只反映原始数据的相关性；固定效应 IV 还要看组内变异，
+
+. display "    在企业数少、工具变量偏弱时系数可能极不稳定，请结合第一阶段结果与理论谨慎解读。"
+    在企业数少、工具变量偏弱时系数可能极不稳定，请结合第一阶段结果与理论谨慎解读。
+
+. 
+. *==============================================================================
+. * 第七部分：模型选择与基准回归（notebook cell 40–49、52–54）
+. *==============================================================================
+. display _n(2) "=================================================="
+
+
+==================================================
+
+. display "第七部分：模型选择与基准回归"
+第七部分：模型选择与基准回归
+
+. display "=================================================="
+==================================================
+
+. 
+. * --- 7.1 Hausman 检验：FE vs RE（cell 41）---------------------------------
+. display _n "【Hausman 检验】固定效应 vs 随机效应（全样本，含 TSLA）"
+
+【Hausman 检验】固定效应 vs 随机效应（全样本，含 TSLA）
+
+. local X_hausman "subsidy_c rd_c subsidy_rd_c subsidy_rd2_c subsidy_lev_c rd_lev_c"
+
+. xtreg tobinq `X_hausman', fe
+
+Fixed-effects (within) regression               Number of obs     =        481
+Group variable: panel_id                        Number of groups  =         22
+
+R-squared:                                      Obs per group:
+     Within  = 0.1132                                         min =          5
+     Between = 0.0349                                         avg =       21.9
+     Overall = 0.0445                                         max =         23
+
+                                                F(6, 453)         =       9.64
+corr(u_i, Xb) = 0.0460                          Prob > F          =     0.0000
+
+-------------------------------------------------------------------------------
+       tobinq | Coefficient  Std. err.      t    P>|t|     [95% conf. interval]
+--------------+----------------------------------------------------------------
+    subsidy_c |  -5.680733   3.218776    -1.76   0.078    -12.00632    .6448513
+         rd_c |  -2.473021   1.629003    -1.52   0.130    -5.674362    .7283197
+ subsidy_rd_c |  -229.1138   119.0628    -1.92   0.055    -463.0978    4.870231
+subsidy_rd2_c |   1969.149    986.909     2.00   0.047     29.66112    3908.637
+subsidy_lev_c |    25.5024   19.73753     1.29   0.197    -13.28607    64.29088
+     rd_lev_c |  -46.66606   6.662107    -7.00   0.000    -59.75853   -33.57359
+        _cons |    1.99299   .0337972    58.97   0.000     1.926571    2.059409
+--------------+----------------------------------------------------------------
+      sigma_u |  1.7226256
+      sigma_e |  .74122996
+          rho |  .84377492   (fraction of variance due to u_i)
+-------------------------------------------------------------------------------
+F test that all u_i=0: F(21, 453) = 103.39                   Prob > F = 0.0000
+
+. estimates store fe_hausman
+
+. xtreg tobinq `X_hausman', re
+
+Random-effects GLS regression                   Number of obs     =        481
+Group variable: panel_id                        Number of groups  =         22
+
+R-squared:                                      Obs per group:
+     Within  = 0.1129                                         min =          5
+     Between = 0.0481                                         avg =       21.9
+     Overall = 0.0528                                         max =         23
+
+                                                Wald chi2(6)      =      57.08
+corr(u_i, X) = 0 (assumed)                      Prob > chi2       =     0.0000
+
+-------------------------------------------------------------------------------
+       tobinq | Coefficient  Std. err.      z    P>|z|     [95% conf. interval]
+--------------+----------------------------------------------------------------
+    subsidy_c |  -6.460162   3.266683    -1.98   0.048    -12.86274   -.0575813
+         rd_c |  -2.139974   1.624129    -1.32   0.188    -5.323208    1.043259
+ subsidy_rd_c |  -251.3062   120.8812    -2.08   0.038    -488.2289   -14.38344
+subsidy_rd2_c |   2160.499   1002.916     2.15   0.031       194.82    4126.177
+subsidy_lev_c |   30.96299    20.0573     1.54   0.123    -8.348593    70.27457
+     rd_lev_c |  -46.32049   6.749424    -6.86   0.000    -59.54911   -33.09186
+        _cons |   1.988996   .2763741     7.20   0.000     1.447312    2.530679
+--------------+----------------------------------------------------------------
+      sigma_u |   1.262033
+      sigma_e |  .74122996
+          rho |  .74351839   (fraction of variance due to u_i)
+-------------------------------------------------------------------------------
+
+. estimates store re_hausman
+
+. hausman fe_hausman re_hausman, sigmamore
+
+                 ---- Coefficients ----
+             |      (b)          (B)            (b-B)     sqrt(diag(V_b-V_B))
+             |   fe_hausman   re_hausman     Difference       Std. err.
+-------------+----------------------------------------------------------------
+   subsidy_c |   -5.680733    -6.460162        .7794285        .2634127
+        rd_c |   -2.473021    -2.139974        -.333047        .3364663
+subsidy_rd_c |   -229.1138    -251.3062        22.19243         9.15183
+subsidy_~2_c |    1969.149     2160.499       -191.3497        62.29922
+subsidy_le~c |     25.5024     30.96299       -5.460587         1.25161
+    rd_lev_c |   -46.66606    -46.32049       -.3455727        .6761664
+------------------------------------------------------------------------------
+                          b = Consistent under H0 and Ha; obtained from xtreg.
+           B = Inconsistent under Ha, efficient under H0; obtained from xtreg.
+
+Test of H0: Difference in coefficients not systematic
+
+    chi2(6) = (b-B)'[(V_b-V_B)^(-1)](b-B)
+            =  22.56
+Prob > chi2 = 0.0010
+
+. show_models fe_hausman re_hausman, title("Hausman：FE vs RE") ///
+>     mtitles("FE" "RE") file("表_hausman_fe_re.rtf")
+
+
+=============== 表：Hausman：FE vs RE ===============
+(output written to 表_hausman_fe_re.rtf)
+
+. 
+. * --- 7.2 是否需要时间效应（cell 43）----------------------------------------
+. display _n "【时间效应检验】FE（不含时间效应）vs FE（含时间效应）"
+
+【时间效应检验】FE（不含时间效应）vs FE（含时间效应）
+
+. xtreg tobinq `X_hausman', fe
+
+Fixed-effects (within) regression               Number of obs     =        481
+Group variable: panel_id                        Number of groups  =         22
+
+R-squared:                                      Obs per group:
+     Within  = 0.1132                                         min =          5
+     Between = 0.0349                                         avg =       21.9
+     Overall = 0.0445                                         max =         23
+
+                                                F(6, 453)         =       9.64
+corr(u_i, Xb) = 0.0460                          Prob > F          =     0.0000
+
+-------------------------------------------------------------------------------
+       tobinq | Coefficient  Std. err.      t    P>|t|     [95% conf. interval]
+--------------+----------------------------------------------------------------
+    subsidy_c |  -5.680733   3.218776    -1.76   0.078    -12.00632    .6448513
+         rd_c |  -2.473021   1.629003    -1.52   0.130    -5.674362    .7283197
+ subsidy_rd_c |  -229.1138   119.0628    -1.92   0.055    -463.0978    4.870231
+subsidy_rd2_c |   1969.149    986.909     2.00   0.047     29.66112    3908.637
+subsidy_lev_c |    25.5024   19.73753     1.29   0.197    -13.28607    64.29088
+     rd_lev_c |  -46.66606   6.662107    -7.00   0.000    -59.75853   -33.57359
+        _cons |    1.99299   .0337972    58.97   0.000     1.926571    2.059409
+--------------+----------------------------------------------------------------
+      sigma_u |  1.7226256
+      sigma_e |  .74122996
+          rho |  .84377492   (fraction of variance due to u_i)
+-------------------------------------------------------------------------------
+F test that all u_i=0: F(21, 453) = 103.39                   Prob > F = 0.0000
+
+. estimates store fe_notime_h
+
+. xtreg tobinq `X_hausman' i.time, fe
+
+Fixed-effects (within) regression               Number of obs     =        481
+Group variable: panel_id                        Number of groups  =         22
+
+R-squared:                                      Obs per group:
+     Within  = 0.1989                                         min =          5
+     Between = 0.0311                                         avg =       21.9
+     Overall = 0.0543                                         max =         23
+
+                                                F(28, 431)        =       3.82
+corr(u_i, Xb) = 0.0350                          Prob > F          =     0.0000
+
+-------------------------------------------------------------------------------
+       tobinq | Coefficient  Std. err.      t    P>|t|     [95% conf. interval]
+--------------+----------------------------------------------------------------
+    subsidy_c |  -4.045567    3.25536    -1.24   0.215    -10.44392    2.352788
+         rd_c |  -2.756656   1.638226    -1.68   0.093    -5.976562    .4632505
+ subsidy_rd_c |  -235.3081   119.0963    -1.98   0.049    -469.3898   -1.226342
+subsidy_rd2_c |   1842.678   984.3509     1.87   0.062     -92.0474    3777.403
+subsidy_lev_c |   26.85438   19.56034     1.37   0.170    -11.59115    65.29991
+     rd_lev_c |  -43.84357    6.61018    -6.63   0.000    -56.83577   -30.85137
+              |
+         time |
+           1  |  -.2290947   .2365684    -0.97   0.333    -.6940659    .2358766
+           2  |   .0604774   .2360885     0.26   0.798    -.4035507    .5245055
+           3  |  -.1096465   .2323425    -0.47   0.637    -.5663118    .3470189
+           4  |  -.0316682   .2297685    -0.14   0.890    -.4832743     .419938
+           5  |  -.3845505   .2304729    -1.67   0.096    -.8375412    .0684402
+           6  |   -.120935   .2299516    -0.53   0.599    -.5729011    .3310312
+           7  |  -.7423116   .2301814    -3.22   0.001    -1.194729    -.289894
+           8  |  -.7209322   .2303358    -3.13   0.002    -1.173653   -.2682111
+           9  |  -.5892911   .2297959    -2.56   0.011    -1.040951   -.1376312
+          10  |  -.4899683   .2301747    -2.13   0.034    -.9423728   -.0375639
+          11  |   -.505676   .2309218    -2.19   0.029    -.9595488   -.0518031
+          12  |  -.5446288   .2311593    -2.36   0.019    -.9989685   -.0902891
+          13  |  -.6107312   .2297605    -2.66   0.008    -1.062322   -.1591408
+          14  |  -.6292299   .2280423    -2.76   0.006    -1.077443   -.1810166
+          15  |  -.5120899   .2304792    -2.22   0.027    -.9650929   -.0590869
+          16  |  -.2872683   .2293036    -1.25   0.211    -.7379607    .1634241
+          17  |  -.4128946   .2304665    -1.79   0.074    -.8658728    .0400835
+          18  |  -.3459398   .2289665    -1.51   0.132    -.7959695      .10409
+          19  |  -.1972834   .2309114    -0.85   0.393    -.6511358    .2565691
+          20  |   -.358922   .2285686    -1.57   0.117    -.8081698    .0903258
+          21  |  -.4152648   .2296267    -1.81   0.071    -.8665923    .0360627
+          22  |  -.6098045   .2308992    -2.64   0.009    -1.063633    -.155976
+              |
+        _cons |   2.380225   .1669443    14.26   0.000     2.052098    2.708351
+--------------+----------------------------------------------------------------
+      sigma_u |  1.7260313
+      sigma_e |  .72228829
+          rho |  .85098041   (fraction of variance due to u_i)
+-------------------------------------------------------------------------------
+F test that all u_i=0: F(21, 431) = 108.23                   Prob > F = 0.0000
+
+. estimates store fe_time_h
+
+. show_models fe_notime_h fe_time_h, title("FE：不含/含时间效应") ///
+>     mtitles("FE(无时间效应)" "FE(含时间效应)") keep(`X_hausman') ///
+>     file("表_fe_time_effects.rtf")
+
+
+=============== 表：FE：不含/含时间效应 ===============
+(output written to 表_fe_time_effects.rtf)
+
+. 
+. *-------------------------------------------------------- 主样本（剔除 TSLA）--
+. * notebook cell 46：剔除特斯拉；cell 47–77 全部基于该样本
+. capture frame drop panel
+
+. frame copy withtsla panel
+
+. frame change panel
+
+. xtset panel_id time
+
+Panel variable: panel_id (unbalanced)
+ Time variable: time, 0 to 22, but with gaps
+         Delta: 1 unit
+
+. quietly count if code == "TSLA"
+
+. local n_tsla = r(N)
+
+. drop if code == "TSLA"
+(23 observations deleted)
+
+. display _n "剔除 TSLA " `n_tsla' " 条观测；现样本 N = " _N
+
+剔除 TSLA 23 条观测；现样本 N = 458
+
+. quietly levelsof code, local(firm_list)
+
+. local nfirm : word count `firm_list'
+
+. display "  企业数 = `nfirm'"
+  企业数 = 21
+
+. 
+. * --- 7.3 基准回归（cell 48）-----------------------------------------------
+. display _n "【模型1】双变量模型（无交互项、无控制变量）"
+
+【模型1】双变量模型（无交互项、无控制变量）
+
+. xtreg tobinq subsidy_c rd_c, fe vce(cluster panel_id)
+
+Fixed-effects (within) regression               Number of obs     =        458
+Group variable: panel_id                        Number of groups  =         21
+
+R-squared:                                      Obs per group:
+     Within  = 0.0192                                         min =          5
+     Between = 0.3831                                         avg =       21.8
+     Overall = 0.0297                                         max =         23
+
+                                                F(2, 20)          =       2.51
+corr(u_i, Xb) = -0.3827                         Prob > F          =     0.1062
+
+                              (Std. err. adjusted for 21 clusters in panel_id)
+------------------------------------------------------------------------------
+             |               Robust
+      tobinq | Coefficient  std. err.      t    P>|t|     [95% conf. interval]
+-------------+----------------------------------------------------------------
+   subsidy_c |  -5.205451   2.704976    -1.92   0.069    -10.84793    .4370295
+        rd_c |    -.97598   1.610341    -0.61   0.551    -4.335092    2.383132
+       _cons |   1.621548   .0016352   991.67   0.000     1.618137    1.624959
+-------------+----------------------------------------------------------------
+     sigma_u |   .5726329
+     sigma_e |  .53255858
+         rho |  .53621246   (fraction of variance due to u_i)
+------------------------------------------------------------------------------
+
+. estimates store m1_twovar
+
+. 
+. display _n "【模型2】基础模型（无交互项）"
+
+【模型2】基础模型（无交互项）
+
+. xtreg tobinq subsidy_c rd_c cf_c salesq_c gm_c roe_c, fe vce(cluster panel_id)
+
+Fixed-effects (within) regression               Number of obs     =        458
+Group variable: panel_id                        Number of groups  =         21
+
+R-squared:                                      Obs per group:
+     Within  = 0.0997                                         min =          5
+     Between = 0.0018                                         avg =       21.8
+     Overall = 0.0110                                         max =         23
+
+                                                F(6, 20)          =       4.68
+corr(u_i, Xb) = -0.5467                         Prob > F          =     0.0040
+
+                              (Std. err. adjusted for 21 clusters in panel_id)
+------------------------------------------------------------------------------
+             |               Robust
+      tobinq | Coefficient  std. err.      t    P>|t|     [95% conf. interval]
+-------------+----------------------------------------------------------------
+   subsidy_c |  -4.280021   2.443615    -1.75   0.095    -9.377313    .8172716
+        rd_c |  -.5701878   1.395306    -0.41   0.687    -3.480746     2.34037
+        cf_c |   .8904213   .4860587     1.83   0.082    -.1234794    1.904322
+    salesq_c |  -.0009573   .0002309    -4.15   0.000    -.0014389   -.0004757
+        gm_c |    .677153   .6363834     1.06   0.300    -.6503196    2.004625
+       roe_c |   .0877215   .2753239     0.32   0.753    -.4865941    .6620371
+       _cons |   1.570942   .0118802   132.23   0.000      1.54616    1.595724
+-------------+----------------------------------------------------------------
+     sigma_u |  .66270284
+     sigma_e |  .51259367
+         rho |  .62567027   (fraction of variance due to u_i)
+------------------------------------------------------------------------------
+
+. estimates store m2_base
+
+. 
+. display _n "【模型3】基础模型（剔除盈利控制 GM）"
+
+【模型3】基础模型（剔除盈利控制 GM）
+
+. xtreg tobinq subsidy_c rd_c cf_c salesq_c roe_c, fe vce(cluster panel_id)
+
+Fixed-effects (within) regression               Number of obs     =        458
+Group variable: panel_id                        Number of groups  =         21
+
+R-squared:                                      Obs per group:
+     Within  = 0.0968                                         min =          5
+     Between = 0.0000                                         avg =       21.8
+     Overall = 0.0053                                         max =         23
+
+                                                F(5, 20)          =       5.61
+corr(u_i, Xb) = -0.5572                         Prob > F          =     0.0022
+
+                              (Std. err. adjusted for 21 clusters in panel_id)
+------------------------------------------------------------------------------
+             |               Robust
+      tobinq | Coefficient  std. err.      t    P>|t|     [95% conf. interval]
+-------------+----------------------------------------------------------------
+   subsidy_c |  -4.499201   2.466305    -1.82   0.083    -9.643824    .6454216
+        rd_c |  -.8062198   1.297707    -0.62   0.541     -3.51319     1.90075
+        cf_c |    .934302   .5068551     1.84   0.080    -.1229793    1.991583
+    salesq_c |  -.0009184    .000214    -4.29   0.000    -.0013648    -.000472
+       roe_c |   .1708988   .2748035     0.62   0.541    -.4023312    .7441288
+       _cons |   1.570521   .0115637   135.81   0.000       1.5464    1.594643
+-------------+----------------------------------------------------------------
+     sigma_u |  .67102773
+     sigma_e |  .51283151
+         rho |  .63128332   (fraction of variance due to u_i)
+------------------------------------------------------------------------------
+
+. estimates store m3_nogm
+
+. 
+. display _n "【模型4】基础模型（Lasso 筛选变量：subsidy_c rd_c bm_c salesq_c）"
+
+【模型4】基础模型（Lasso 筛选变量：subsidy_c rd_c bm_c salesq_c）
+
+. xtreg tobinq subsidy_c rd_c bm_c salesq_c, fe vce(cluster panel_id)
+
+Fixed-effects (within) regression               Number of obs     =        458
+Group variable: panel_id                        Number of groups  =         21
+
+R-squared:                                      Obs per group:
+     Within  = 0.3129                                         min =          5
+     Between = 0.2818                                         avg =       21.8
+     Overall = 0.2352                                         max =         23
+
+                                                F(4, 20)          =      22.00
+corr(u_i, Xb) = -0.6996                         Prob > F          =     0.0000
+
+                              (Std. err. adjusted for 21 clusters in panel_id)
+------------------------------------------------------------------------------
+             |               Robust
+      tobinq | Coefficient  std. err.      t    P>|t|     [95% conf. interval]
+-------------+----------------------------------------------------------------
+   subsidy_c |  -3.741609   1.921856    -1.95   0.066    -7.750531    .2673128
+        rd_c |  -.0575432   1.096915    -0.05   0.959    -2.345667    2.230581
+        bm_c |  -1.355924   .4088051    -3.32   0.003    -2.208676   -.5031711
+    salesq_c |  -.0008947   .0001318    -6.79   0.000    -.0011697   -.0006198
+       _cons |   1.600917   .0079466   201.46   0.000     1.584341    1.617493
+-------------+----------------------------------------------------------------
+     sigma_u |  .68256924
+     sigma_e |  .44677386
+         rho |  .70006824   (fraction of variance due to u_i)
+------------------------------------------------------------------------------
+
+. estimates store m4_lasso
+
+. 
+. show_models m1_twovar m2_base m3_nogm m4_lasso, ///
+>     title("模型对比：基准回归") ///
+>     mtitles("双变量" "基础模型" "基础模型(无GM)" "基础模型(Lasso筛选)") ///
+>     keep(subsidy_c rd_c cf_c salesq_c gm_c roe_c bm_c) ///
+>     file("表_基准回归.rtf")
+
+
+=============== 表：模型对比：基准回归 ===============
+(output written to 表_基准回归.rtf)
+
+. 
+. * --- 7.4 产权性质调节效应（cell 49）---------------------------------------
+. display _n "【模型A/B】加入 subsidy×SOE 交互项"
+
+【模型A/B】加入 subsidy×SOE 交互项
+
+. * SOE 不随时间变化，会被企业固定效应吸收，故只放交互项
+. gen subsidy_c_soe = subsidy_c * soe
+
+. gen subsidy_c_lev = subsidy_c * lev_c
+
+. 
+. xtreg tobinq subsidy_c rd_c subsidy_c_soe cf_c salesq_c gm_c, fe vce(cluster panel_id)
+
+Fixed-effects (within) regression               Number of obs     =        458
+Group variable: panel_id                        Number of groups  =         21
+
+R-squared:                                      Obs per group:
+     Within  = 0.1292                                         min =          5
+     Between = 0.0007                                         avg =       21.8
+     Overall = 0.0131                                         max =         23
+
+                                                F(6, 20)          =      12.77
+corr(u_i, Xb) = -0.5236                         Prob > F          =     0.0000
+
+                               (Std. err. adjusted for 21 clusters in panel_id)
+-------------------------------------------------------------------------------
+              |               Robust
+       tobinq | Coefficient  std. err.      t    P>|t|     [95% conf. interval]
+--------------+----------------------------------------------------------------
+    subsidy_c |  -19.37507   3.993136    -4.85   0.000     -27.7046   -11.04553
+         rd_c |  -.9363267   1.233658    -0.76   0.457    -3.509693    1.637039
+subsidy_c_soe |   18.58171   4.362664     4.26   0.000     9.481348    27.68206
+         cf_c |   .6963153   .4523152     1.54   0.139    -.2471976    1.639828
+     salesq_c |  -.0008935   .0002233    -4.00   0.001    -.0013592   -.0004277
+         gm_c |   .5895153   .5558048     1.06   0.301    -.5698731    1.748904
+        _cons |   1.570873   .0117409   133.79   0.000     1.546381    1.595364
+--------------+----------------------------------------------------------------
+      sigma_u |  .65700813
+      sigma_e |  .50411381
+          rho |  .62943382   (fraction of variance due to u_i)
+-------------------------------------------------------------------------------
+
+. estimates store m_soeA
+
+. display _n "模型A：边际效应"
+
+模型A：边际效应
+
+. display "  非国企组 subsidy 效应 = " %9.4f _b[subsidy_c] ///
+>         "  (p = " %6.4f 2*ttail(e(df_r), abs(_b[subsidy_c]/_se[subsidy_c])) ")"
+  非国企组 subsidy 效应 =  -19.3751  (p = 0.0001)
+
+. display "  国企组 subsidy 效应 = subsidy_c + subsidy_c_soe："
+  国企组 subsidy 效应 = subsidy_c + subsidy_c_soe：
+
+. lincom subsidy_c + subsidy_c_soe
+
+ ( 1)  subsidy_c + subsidy_c_soe = 0
+
+------------------------------------------------------------------------------
+      tobinq | Coefficient  Std. err.      t    P>|t|     [95% conf. interval]
+-------------+----------------------------------------------------------------
+         (1) |  -.7933612   1.838909    -0.43   0.671    -4.629259    3.042537
+------------------------------------------------------------------------------
+
+. display "  组间差异（subsidy×SOE）= " %9.4f _b[subsidy_c_soe] ///
+>         "  (p = " %6.4f 2*ttail(e(df_r), abs(_b[subsidy_c_soe]/_se[subsidy_c_soe])) ")"
+  组间差异（subsidy×SOE）=   18.5817  (p = 0.0004)
+
+. 
+. xtreg tobinq subsidy_c rd_c subsidy_c_soe subsidy_c_lev cf_c salesq_c gm_c, ///
+>     fe vce(cluster panel_id)
+
+Fixed-effects (within) regression               Number of obs     =        458
+Group variable: panel_id                        Number of groups  =         21
+
+R-squared:                                      Obs per group:
+     Within  = 0.1337                                         min =          5
+     Between = 0.0008                                         avg =       21.8
+     Overall = 0.0144                                         max =         23
+
+                                                F(7, 20)          =      17.90
+corr(u_i, Xb) = -0.5169                         Prob > F          =     0.0000
+
+                               (Std. err. adjusted for 21 clusters in panel_id)
+-------------------------------------------------------------------------------
+              |               Robust
+       tobinq | Coefficient  std. err.      t    P>|t|     [95% conf. interval]
+--------------+----------------------------------------------------------------
+    subsidy_c |  -19.66948   3.390964    -5.80   0.000    -26.74291   -12.59606
+         rd_c |  -1.083488   1.190234    -0.91   0.373    -3.566273    1.399297
+subsidy_c_soe |    18.8977   3.944906     4.79   0.000     10.66877    27.12663
+subsidy_c_lev |   19.02184   10.65547     1.79   0.089    -3.205079    41.24876
+         cf_c |   .6940449    .458383     1.51   0.146    -.2621253    1.650215
+     salesq_c |  -.0008862   .0002202    -4.03   0.001    -.0013455    -.000427
+         gm_c |    .555345   .5498978     1.01   0.325    -.5917218    1.702412
+        _cons |    1.57083   .0116019   135.39   0.000     1.546629    1.595031
+--------------+----------------------------------------------------------------
+      sigma_u |  .65452994
+      sigma_e |  .50339577
+          rho |  .62833518   (fraction of variance due to u_i)
+-------------------------------------------------------------------------------
+
+. estimates store m_soeB
+
+. display _n "模型B：国企组 subsidy 效应 = subsidy_c + subsidy_c_soe"
+
+模型B：国企组 subsidy 效应 = subsidy_c + subsidy_c_soe
+
+. lincom subsidy_c + subsidy_c_soe
+
+ ( 1)  subsidy_c + subsidy_c_soe = 0
+
+------------------------------------------------------------------------------
+      tobinq | Coefficient  Std. err.      t    P>|t|     [95% conf. interval]
+-------------+----------------------------------------------------------------
+         (1) |  -.7717793   2.212434    -0.35   0.731    -5.386836    3.843277
+------------------------------------------------------------------------------
+
+. 
+. show_models m2_base m_soeA m_soeB, title("基准模型 vs 加入产权性质调节") ///
+>     mtitles("基准模型" "模型A:+Subsidy×SOE" "模型B:+Subsidy×SOE+Subsidy×Lev") ///
+>     keep(subsidy_c subsidy_c_soe subsidy_c_lev rd_c cf_c gm_c salesq_c) ///
+>     file("表_产权性质调节.rtf")
+
+
+=============== 表：基准模型 vs 加入产权性质调节 ===============
+(output written to 表_产权性质调节.rtf)
+
+. 
+. * --- 7.5 国企 / 非国企分组回归（cell 52）-----------------------------------
+. display _n "【分组回归】国企组（SOE=1）"
+
+【分组回归】国企组（SOE=1）
+
+. xtreg tobinq subsidy_c rd_c cf_c gm_c salesq_c roe_c if soe == 1, fe vce(cluster panel_id)
+
+Fixed-effects (within) regression               Number of obs     =        296
+Group variable: panel_id                        Number of groups  =         13
+
+R-squared:                                      Obs per group:
+     Within  = 0.0663                                         min =         20
+     Between = 0.0431                                         avg =       22.8
+     Overall = 0.0001                                         max =         23
+
+                                                F(6, 12)          =       3.93
+corr(u_i, Xb) = -0.2300                         Prob > F          =     0.0208
+
+                              (Std. err. adjusted for 13 clusters in panel_id)
+------------------------------------------------------------------------------
+             |               Robust
+      tobinq | Coefficient  std. err.      t    P>|t|     [95% conf. interval]
+-------------+----------------------------------------------------------------
+   subsidy_c |  -.8817369   1.703467    -0.52   0.614    -4.593273    2.829799
+        rd_c |  -.4710937   .4614729    -1.02   0.327    -1.476557    .5343695
+        cf_c |  -.1329389   .2475563    -0.54   0.601    -.6723178    .4064401
+        gm_c |   1.145722   .6507005     1.76   0.104    -.2720331    2.563476
+    salesq_c |   .0000355   .0000995     0.36   0.727    -.0001814    .0002524
+       roe_c |   -.547419   .2525308    -2.17   0.051    -1.097636    .0027983
+       _cons |   1.342113   .0217532    61.70   0.000     1.294717    1.389509
+-------------+----------------------------------------------------------------
+     sigma_u |  .35742625
+     sigma_e |  .24477289
+         rho |  .68074475   (fraction of variance due to u_i)
+------------------------------------------------------------------------------
+
+. estimates store m_soe1
+
+. display _n "【分组回归】非国企组（SOE=0）"
+
+【分组回归】非国企组（SOE=0）
+
+. xtreg tobinq subsidy_c rd_c cf_c gm_c salesq_c roe_c if soe == 0, fe vce(cluster panel_id)
+
+Fixed-effects (within) regression               Number of obs     =        162
+Group variable: panel_id                        Number of groups  =          8
+
+R-squared:                                      Obs per group:
+     Within  = 0.1845                                         min =          5
+     Between = 0.1204                                         avg =       20.2
+     Overall = 0.0172                                         max =         23
+
+                                                F(6, 7)           =      26.95
+corr(u_i, Xb) = -0.6702                         Prob > F          =     0.0002
+
+                               (Std. err. adjusted for 8 clusters in panel_id)
+------------------------------------------------------------------------------
+             |               Robust
+      tobinq | Coefficient  std. err.      t    P>|t|     [95% conf. interval]
+-------------+----------------------------------------------------------------
+   subsidy_c |  -17.05495   3.297502    -5.17   0.001     -24.8523   -9.257597
+        rd_c |  -.3256887   2.853527    -0.11   0.912    -7.073208     6.42183
+        cf_c |    2.11261   .8917478     2.37   0.050     .0039616    4.221259
+        gm_c |  -.1554287   1.134404    -0.14   0.895    -2.837869    2.527011
+    salesq_c |  -.0011446   .0003818    -3.00   0.020    -.0020474   -.0002417
+       roe_c |   .8318547   .5705801     1.46   0.188    -.5173527    2.181062
+       _cons |   2.174475   .0984886    22.08   0.000     1.941587    2.407364
+-------------+----------------------------------------------------------------
+     sigma_u |  .69331064
+     sigma_e |  .77146129
+         rho |  .44679798   (fraction of variance due to u_i)
+------------------------------------------------------------------------------
+
+. estimates store m_soe0
+
+. show_models m2_base m_soe1 m_soe0, title("所有制分组回归") ///
+>     mtitles("全样本" "国企(SOE=1)" "非国企(SOE=0)") ///
+>     keep(subsidy_c rd_c cf_c gm_c salesq_c roe_c) ///
+>     file("表_所有制分组.rtf")
+
+
+=============== 表：所有制分组回归 ===============
+(output written to 表_所有制分组.rtf)
+
+. 
+. * --- 7.6 交互项回归（cell 54）---------------------------------------------
+. display _n "【模型】全样本（含全部交互项）"
+
+【模型】全样本（含全部交互项）
+
+. xtreg tobinq subsidy_c rd_c cf_c gm_c salesq_c ///
+>     subsidy_rd subsidy_rd2 subsidy_lev rd_lev salesq_sub, fe vce(cluster panel_id)
+
+Fixed-effects (within) regression               Number of obs     =        458
+Group variable: panel_id                        Number of groups  =         21
+
+R-squared:                                      Obs per group:
+     Within  = 0.2826                                         min =          5
+     Between = 0.0328                                         avg =       21.8
+     Overall = 0.1006                                         max =         23
+
+                                                F(10, 20)         =      14.05
+corr(u_i, Xb) = -0.4032                         Prob > F          =     0.0000
+
+                              (Std. err. adjusted for 21 clusters in panel_id)
+------------------------------------------------------------------------------
+             |               Robust
+      tobinq | Coefficient  std. err.      t    P>|t|     [95% conf. interval]
+-------------+----------------------------------------------------------------
+   subsidy_c |  -5.548487   3.308452    -1.68   0.109     -12.4498    1.352823
+        rd_c |  -2.815699   3.258771    -0.86   0.398    -9.613377    3.981979
+        cf_c |   .5467446   .4788166     1.14   0.267    -.4520493    1.545539
+        gm_c |   .7881817   .6054211     1.30   0.208    -.4747045    2.051068
+    salesq_c |  -.0007859   .0001915    -4.10   0.001    -.0011854   -.0003865
+  subsidy_rd |   -157.087   75.73843    -2.07   0.051    -315.0746    .9006108
+ subsidy_rd2 |   1335.088   630.9804     2.12   0.047     18.88564     2651.29
+ subsidy_lev |   31.59507   20.63981     1.53   0.141    -11.45883    74.64897
+      rd_lev |  -41.97538   12.81145    -3.28   0.004    -68.69959   -15.25116
+  salesq_sub |  -.0065793   .0096255    -0.68   0.502    -.0266577     .013499
+       _cons |   1.552099   .0123527   125.65   0.000     1.526332    1.577867
+-------------+----------------------------------------------------------------
+     sigma_u |  .60785667
+     sigma_e |  .45972028
+         rho |  .63613822   (fraction of variance due to u_i)
+------------------------------------------------------------------------------
+
+. estimates store m_int_all
+
+. 
+. foreach v in subsidy_rd subsidy_rd2 subsidy_lev rd_lev salesq_sub {
+  2.     display _n "【模型】逐一放入交互项：`v'"
+  3.     xtreg tobinq subsidy_c rd_c cf_c gm_c salesq_c `v', fe vce(cluster panel_id)
+  4.     estimates store m_int_`v'
+  5. }
+
+【模型】逐一放入交互项：subsidy_rd
+
+Fixed-effects (within) regression               Number of obs     =        458
+Group variable: panel_id                        Number of groups  =         21
+
+R-squared:                                      Obs per group:
+     Within  = 0.1060                                         min =          5
+     Between = 0.0064                                         avg =       21.8
+     Overall = 0.0174                                         max =         23
+
+                                                F(6, 20)          =       4.11
+corr(u_i, Xb) = -0.5313                         Prob > F          =     0.0076
+
+                              (Std. err. adjusted for 21 clusters in panel_id)
+------------------------------------------------------------------------------
+             |               Robust
+      tobinq | Coefficient  std. err.      t    P>|t|     [95% conf. interval]
+-------------+----------------------------------------------------------------
+   subsidy_c |  -3.765061   2.058614    -1.83   0.082    -8.059255    .5291321
+        rd_c |  -.3204769    1.35826    -0.24   0.816    -3.153757    2.512803
+        cf_c |   .8765844   .4711107     1.86   0.078    -.1061353    1.859304
+        gm_c |   .8105095   .5903895     1.37   0.185    -.4210215     2.04204
+    salesq_c |  -.0009569   .0002276    -4.20   0.000    -.0014317   -.0004822
+  subsidy_rd |  -72.76331   44.82572    -1.62   0.120    -166.2681    20.74151
+       _cons |   1.575213   .0114362   137.74   0.000     1.551357    1.599069
+-------------+----------------------------------------------------------------
+     sigma_u |  .65237275
+     sigma_e |   .5107914
+         rho |  .61994379   (fraction of variance due to u_i)
+------------------------------------------------------------------------------
+
+【模型】逐一放入交互项：subsidy_rd2
+
+Fixed-effects (within) regression               Number of obs     =        458
+Group variable: panel_id                        Number of groups  =         21
+
+R-squared:                                      Obs per group:
+     Within  = 0.1027                                         min =          5
+     Between = 0.0040                                         avg =       21.8
+     Overall = 0.0144                                         max =         23
+
+                                                F(6, 20)          =       4.72
+corr(u_i, Xb) = -0.5390                         Prob > F          =     0.0038
+
+                              (Std. err. adjusted for 21 clusters in panel_id)
+------------------------------------------------------------------------------
+             |               Robust
+      tobinq | Coefficient  std. err.      t    P>|t|     [95% conf. interval]
+-------------+----------------------------------------------------------------
+   subsidy_c |  -3.316811   2.422121    -1.37   0.186    -8.369268    1.735646
+        rd_c |  -.4825489    1.36196    -0.35   0.727    -3.323548     2.35845
+        cf_c |   .9093312   .4870775     1.87   0.077    -.1066946    1.925357
+        gm_c |   .8025151    .594114     1.35   0.192     -.436785    2.041815
+    salesq_c |  -.0009603   .0002299    -4.18   0.000      -.00144   -.0004807
+ subsidy_rd2 |  -415.4816   232.3363    -1.79   0.089    -900.1265    69.16336
+       _cons |   1.570658   .0118772   132.24   0.000     1.545883    1.595434
+-------------+----------------------------------------------------------------
+     sigma_u |  .65748139
+     sigma_e |  .51175017
+         rho |  .62273185   (fraction of variance due to u_i)
+------------------------------------------------------------------------------
+
+【模型】逐一放入交互项：subsidy_lev
+
+Fixed-effects (within) regression               Number of obs     =        458
+Group variable: panel_id                        Number of groups  =         21
+
+R-squared:                                      Obs per group:
+     Within  = 0.1030                                         min =          5
+     Between = 0.0024                                         avg =       21.8
+     Overall = 0.0126                                         max =         23
+
+                                                F(6, 20)          =       4.43
+corr(u_i, Xb) = -0.5387                         Prob > F          =     0.0052
+
+                              (Std. err. adjusted for 21 clusters in panel_id)
+------------------------------------------------------------------------------
+             |               Robust
+      tobinq | Coefficient  std. err.      t    P>|t|     [95% conf. interval]
+-------------+----------------------------------------------------------------
+   subsidy_c |  -4.313439   2.787069    -1.55   0.137    -10.12716    1.500286
+        rd_c |   -.718008   1.354957    -0.53   0.602      -3.5444    2.108384
+        cf_c |   .8830764   .4881673     1.81   0.086    -.1352228    1.901376
+        gm_c |   .6987736   .5796452     1.21   0.242     -.510345    1.907892
+    salesq_c |  -.0009494   .0002265    -4.19   0.000    -.0014219   -.0004768
+ subsidy_lev |   16.84653   19.60088     0.86   0.400    -24.04019    57.73324
+       _cons |   1.571003   .0118063   133.06   0.000     1.546375    1.595631
+-------------+----------------------------------------------------------------
+     sigma_u |  .65881121
+     sigma_e |  .51165218
+         rho |  .62377067   (fraction of variance due to u_i)
+------------------------------------------------------------------------------
+
+【模型】逐一放入交互项：rd_lev
+
+Fixed-effects (within) regression               Number of obs     =        458
+Group variable: panel_id                        Number of groups  =         21
+
+R-squared:                                      Obs per group:
+     Within  = 0.2670                                         min =          5
+     Between = 0.0250                                         avg =       21.8
+     Overall = 0.0835                                         max =         23
+
+                                                F(6, 20)          =      11.71
+corr(u_i, Xb) = -0.4540                         Prob > F          =     0.0000
+
+                              (Std. err. adjusted for 21 clusters in panel_id)
+------------------------------------------------------------------------------
+             |               Robust
+      tobinq | Coefficient  std. err.      t    P>|t|     [95% conf. interval]
+-------------+----------------------------------------------------------------
+   subsidy_c |  -1.990625   2.339119    -0.85   0.405    -6.869942    2.888692
+        rd_c |   -2.80036   3.274574    -0.86   0.403    -9.631001    4.030281
+        cf_c |    .669426   .4953749     1.35   0.192     -.363908     1.70276
+        gm_c |   .9016119   .6259701     1.44   0.165    -.4041388    2.207363
+    salesq_c |  -.0008433   .0001793    -4.70   0.000    -.0012172   -.0004693
+      rd_lev |   -40.9427   13.06419    -3.13   0.005    -68.19413   -13.69128
+       _cons |   1.544786   .0131522   117.45   0.000     1.517351    1.572221
+-------------+----------------------------------------------------------------
+     sigma_u |  .63032419
+     sigma_e |  .46252776
+         rho |  .65000368   (fraction of variance due to u_i)
+------------------------------------------------------------------------------
+
+【模型】逐一放入交互项：salesq_sub
+
+Fixed-effects (within) regression               Number of obs     =        458
+Group variable: panel_id                        Number of groups  =         21
+
+R-squared:                                      Obs per group:
+     Within  = 0.1003                                         min =          5
+     Between = 0.0013                                         avg =       21.8
+     Overall = 0.0109                                         max =         23
+
+                                                F(6, 20)          =       6.09
+corr(u_i, Xb) = -0.5254                         Prob > F          =     0.0009
+
+                              (Std. err. adjusted for 21 clusters in panel_id)
+------------------------------------------------------------------------------
+             |               Robust
+      tobinq | Coefficient  std. err.      t    P>|t|     [95% conf. interval]
+-------------+----------------------------------------------------------------
+   subsidy_c |  -5.721661   2.856033    -2.00   0.059    -11.67924    .2359187
+        rd_c |  -.5547446   1.405198    -0.39   0.697    -3.485936    2.376447
+        cf_c |   .8643022   .4867497     1.78   0.091      -.15104    1.879644
+        gm_c |   .7246189   .5891739     1.23   0.233    -.5043762    1.953614
+    salesq_c |  -.0009263   .0002443    -3.79   0.001    -.0014359   -.0004166
+  salesq_sub |  -.0060431   .0099144    -0.61   0.549    -.0267242    .0146381
+       _cons |   1.569025   .0108896   144.08   0.000     1.546309     1.59174
+-------------+----------------------------------------------------------------
+     sigma_u |  .65243247
+     sigma_e |    .512435
+         rho |  .61847197   (fraction of variance due to u_i)
+------------------------------------------------------------------------------
+
+. show_models m_int_all m_int_subsidy_rd m_int_subsidy_rd2 m_int_subsidy_lev ///
+>     m_int_rd_lev m_int_salesq_sub, title("交互项模型对比") ///
+>     mtitles("全样本" "Subsidy×RD" "Subsidy×RD²" "Subsidy×Lev" "RD×Lev" "SalesQ×Subsidy") ///
+>     keep(subsidy_c rd_c cf_c gm_c salesq_c subsidy_rd subsidy_rd2 subsidy_lev rd_lev salesq_sub) ///
+>     file("表_交互项.rtf")
+
+
+=============== 表：交互项模型对比 ===============
+(output written to 表_交互项.rtf)
+
+. 
+. * 注：notebook cell 56「中介变量检验」是空单元，无内容可译。
+. 
+. *==============================================================================
+. * 第八部分：稳健性检验（notebook cell 57–66）
+. *==============================================================================
+. display _n(2) "=================================================="
+
+
+==================================================
+
+. display "第八部分：稳健性检验"
+第八部分：稳健性检验
+
+. display "=================================================="
+==================================================
+
+. 
+. * --- 8.1 替换因变量为 ROA（cell 58）---------------------------------------
+. display _n "【5.1】替换因变量：ROA"
+
+【5.1】替换因变量：ROA
+
+. xtreg roa subsidy rd lev cf salesq gm bm, fe vce(cluster panel_id)
+
+Fixed-effects (within) regression               Number of obs     =        458
+Group variable: panel_id                        Number of groups  =         21
+
+R-squared:                                      Obs per group:
+     Within  = 0.3532                                         min =          5
+     Between = 0.7239                                         avg =       21.8
+     Overall = 0.5618                                         max =         23
+
+                                                F(7, 20)          =      21.32
+corr(u_i, Xb) = -0.1182                         Prob > F          =     0.0000
+
+                              (Std. err. adjusted for 21 clusters in panel_id)
+------------------------------------------------------------------------------
+             |               Robust
+         roa | Coefficient  std. err.      t    P>|t|     [95% conf. interval]
+-------------+----------------------------------------------------------------
+     subsidy |   .1149578   .0273483     4.20   0.000     .0579104    .1720053
+          rd |  -.1485634   .0455466    -3.26   0.004     -.243572   -.0535549
+         lev |   -.038248   .0173679    -2.20   0.040    -.0744767   -.0020193
+          cf |   .0055192   .0135931     0.41   0.689    -.0228355    .0338739
+      salesq |   .0000107   3.91e-06     2.73   0.013     2.50e-06    .0000188
+          gm |   .1349147   .0156603     8.62   0.000     .1022479    .1675816
+          bm |  -.0038815    .004183    -0.93   0.365    -.0126072    .0048442
+       _cons |   .0143468   .0124913     1.15   0.264    -.0117096    .0404032
+-------------+----------------------------------------------------------------
+     sigma_u |  .00812064
+     sigma_e |  .01159894
+         rho |  .32893406   (fraction of variance due to u_i)
+------------------------------------------------------------------------------
+
+. estimates store r_roa
+
+. 
+. * --- 8.2 加入时间固定效应（cell 60）---------------------------------------
+. display _n "【5.2】加入时间固定效应（双向固定效应）"
+
+【5.2】加入时间固定效应（双向固定效应）
+
+. xtreg tobinq subsidy rd cf gm salesq roe i.time, fe vce(cluster panel_id)
+
+Fixed-effects (within) regression               Number of obs     =        458
+Group variable: panel_id                        Number of groups  =         21
+
+R-squared:                                      Obs per group:
+     Within  = 0.1760                                         min =          5
+     Between = 0.0002                                         avg =       21.8
+     Overall = 0.0232                                         max =         23
+
+                                                F(20, 20)         =          .
+corr(u_i, Xb) = -0.4920                         Prob > F          =          .
+
+                              (Std. err. adjusted for 21 clusters in panel_id)
+------------------------------------------------------------------------------
+             |               Robust
+      tobinq | Coefficient  std. err.      t    P>|t|     [95% conf. interval]
+-------------+----------------------------------------------------------------
+     subsidy |  -4.456068   2.740064    -1.63   0.120    -10.17174    1.259605
+          rd |  -.9487597   1.380652    -0.69   0.500    -3.828748    1.931229
+          cf |   .5704219   .4731039     1.21   0.242    -.4164556    1.557299
+          gm |   .8057977     .59897     1.35   0.194    -.4436319    2.055227
+      salesq |  -.0008841    .000203    -4.36   0.000    -.0013075   -.0004607
+         roe |   .0878709   .3037675     0.29   0.775     -.545777    .7215188
+             |
+        time |
+          1  |  -.1701152    .096213    -1.77   0.092     -.370812    .0305817
+          2  |   .1507191    .134183     1.12   0.275    -.1291818    .4306199
+          3  |  -.0821517   .2242819    -0.37   0.718    -.5499956    .3856922
+          4  |   .0221052   .1875147     0.12   0.907    -.3690437    .4132541
+          5  |  -.3116581   .2531226    -1.23   0.233    -.8396625    .2163464
+          6  |  -.0152313    .269274    -0.06   0.955    -.5769271    .5464645
+          7  |  -.2824859   .3166511    -0.89   0.383    -.9430084    .3780366
+          8  |   -.314799   .3039379    -1.04   0.313    -.9488024    .3192044
+          9  |  -.3676546   .3025595    -1.22   0.238    -.9987826    .2634733
+         10  |  -.3224568   .2962732    -1.09   0.289    -.9404719    .2955582
+         11  |  -.2939339   .2773059    -1.06   0.302    -.8723839    .2845162
+         12  |  -.1940773   .3084122    -0.63   0.536    -.8374139    .4492593
+         13  |  -.3011309   .3385922    -0.89   0.384    -1.007422    .4051601
+         14  |  -.3152636   .3288183    -0.96   0.349    -1.001167    .3706395
+         15  |  -.2343738   .3090024    -0.76   0.457    -.8789415    .4101939
+         16  |  -.1385516    .328597    -0.42   0.678    -.8239929    .5468896
+         17  |  -.1447963   .3023654    -0.48   0.637    -.7755194    .4859269
+         18  |  -.1169121    .319051    -0.37   0.718    -.7824409    .5486168
+         19  |  -.0960608    .316582    -0.30   0.765    -.7564393    .5643177
+         20  |  -.1795211   .3135904    -0.57   0.573    -.8336591     .474617
+         21  |  -.3040587   .3185363    -0.95   0.351    -.9685138    .3603964
+         22  |   -.517693   .3095898    -1.67   0.110    -1.163486    .1281001
+             |
+       _cons |   2.077081    .286026     7.26   0.000     1.480441     2.67372
+-------------+----------------------------------------------------------------
+     sigma_u |  .65298327
+     sigma_e |  .50342157
+         rho |  .62720556   (fraction of variance due to u_i)
+------------------------------------------------------------------------------
+
+. estimates store r_twfe
+
+. 
+. * --- 8.3 加入特斯拉（cell 62）---------------------------------------------
+. display _n "【5.3】含特斯拉样本（回到含 TSLA 的 withtsla 帧）"
+
+【5.3】含特斯拉样本（回到含 TSLA 的 withtsla 帧）
+
+. frame change withtsla
+
+. xtset panel_id time
+
+Panel variable: panel_id (unbalanced)
+ Time variable: time, 0 to 22, but with gaps
+         Delta: 1 unit
+
+. xtreg tobinq subsidy rd cf gm salesq roe, fe vce(cluster panel_id)
+
+Fixed-effects (within) regression               Number of obs     =        481
+Group variable: panel_id                        Number of groups  =         22
+
+R-squared:                                      Obs per group:
+     Within  = 0.1341                                         min =          5
+     Between = 0.1651                                         avg =       21.9
+     Overall = 0.0884                                         max =         23
+
+                                                F(6, 21)          =       2.62
+corr(u_i, Xb) = -0.6258                         Prob > F          =     0.0466
+
+                              (Std. err. adjusted for 22 clusters in panel_id)
+------------------------------------------------------------------------------
+             |               Robust
+      tobinq | Coefficient  std. err.      t    P>|t|     [95% conf. interval]
+-------------+----------------------------------------------------------------
+     subsidy |  -4.025388   2.430879    -1.66   0.113    -9.080678    1.029902
+          rd |   1.019102   2.065979     0.49   0.627    -3.277336    5.315541
+          cf |   1.286329   .6074745     2.12   0.046     .0230161    2.549641
+          gm |   1.606916   .9355283     1.72   0.101    -.3386216    3.552454
+      salesq |  -.0015275   .0005618    -2.72   0.013    -.0026958   -.0003592
+         roe |   .0290048   .2825196     0.10   0.919    -.5585268    .6165365
+       _cons |   2.293085   .1746258    13.13   0.000     1.929931    2.656239
+-------------+----------------------------------------------------------------
+     sigma_u |  2.1508419
+     sigma_e |  .73244143
+         rho |  .89608504   (fraction of variance due to u_i)
+------------------------------------------------------------------------------
+
+. estimates store r_tsla
+
+. 
+. * --- 8.4 不做缩尾（cell 64/65）-------------------------------------------
+. display _n "【5.4】全样本不做缩尾（原始数据 -> 插值 -> 剔除不完整 -> 中心化）"
+
+【5.4】全样本不做缩尾（原始数据 -> 插值 -> 剔除不完整 -> 中心化）
+
+. capture frame drop nowinsor
+
+. frame copy raw nowinsor
+
+. frame change nowinsor
+
+. gen qnum = real(substr(quarter, strlen(quarter), 1))
+
+. assert !missing(qnum)
+
+. gen time = (year - 2021) * 4 + qnum
+
+. sort code time
+
+. egen panel_id = group(code)
+
+. xtset panel_id time
+
+Panel variable: panel_id (unbalanced)
+ Time variable: time, 0 to 23, but with gaps
+         Delta: 1 unit
+
+. drop if code == "TSLA"
+(24 observations deleted)
+
+. local num_cols2 "year qnum time tobinq subsidy rd soe lev cf salesq roa roe gm bm"
+
+. local imp_cols2 "subsidy rd soe lev cf salesq roa gm roe bm"
+
+. prepare_panel, impute(`imp_cols2') dropna(`num_cols2')
+  [prepare_panel] 已完成企业内线性插值（TobinQ 与被解释变量除外）
+  [prepare_panel] 剔除不完整观测后 N = 458
+  [prepare_panel] 已完成中心化与交互项构建
+
+. xtreg tobinq subsidy rd cf salesq gm roe, fe vce(cluster panel_id)
+
+Fixed-effects (within) regression               Number of obs     =        458
+Group variable: panel_id                        Number of groups  =         21
+
+R-squared:                                      Obs per group:
+     Within  = 0.0880                                         min =          5
+     Between = 0.0017                                         avg =       21.8
+     Overall = 0.0103                                         max =         23
+
+                                                F(6, 20)          =       5.17
+corr(u_i, Xb) = -0.5005                         Prob > F          =     0.0024
+
+                              (Std. err. adjusted for 21 clusters in panel_id)
+------------------------------------------------------------------------------
+             |               Robust
+      tobinq | Coefficient  std. err.      t    P>|t|     [95% conf. interval]
+-------------+----------------------------------------------------------------
+     subsidy |  -2.625749   1.723626    -1.52   0.143     -6.22117    .9696724
+          rd |  -.5994339   1.395425    -0.43   0.672    -3.510239    2.311371
+          cf |   .8378564   .4780035     1.75   0.095    -.1592414    1.834954
+      salesq |  -.0008347   .0002084    -4.00   0.001    -.0012694   -.0003999
+          gm |   .5426867   .5575601     0.97   0.342    -.6203632    1.705737
+         roe |   .0183589   .1380162     0.13   0.896    -.2695378    .3062556
+       _cons |   1.848933   .1249897    14.79   0.000     1.588209    2.109657
+-------------+----------------------------------------------------------------
+     sigma_u |  .63896086
+     sigma_e |  .51598533
+         rho |  .60528363   (fraction of variance due to u_i)
+------------------------------------------------------------------------------
+
+. estimates store r_nowinsor
+
+. 
+. frame change panel
+
+. xtset panel_id time
+
+Panel variable: panel_id (unbalanced)
+ Time variable: time, 0 to 22, but with gaps
+         Delta: 1 unit
+
+. show_models r_roa r_twfe r_tsla r_nowinsor, title("稳健性检验") ///
+>     mtitles("替换因变量ROA" "加入时间效应" "含特斯拉" "全样本不缩尾") ///
+>     keep(subsidy rd cf gm salesq roe lev bm) file("表_稳健性检验.rtf")
+
+
+=============== 表：稳健性检验 ===============
+(output written to 表_稳健性检验.rtf)
+
+. 
+. *==============================================================================
+. * 第九部分：异质性检验（notebook cell 67–77）
+. *==============================================================================
+. display _n(2) "=================================================="
+
+
+==================================================
+
+. display "第九部分：异质性检验"
+第九部分：异质性检验
+
+. display "=================================================="
+==================================================
+
+. 
+. * --- 9.1 大企业 / 小企业（cell 70）----------------------------------------
+. * notebook 原写法按"季度规模"分组会把同一家企业拆到两组；这里改为按"企业"分组：
+. * 用各企业平均营业收入(SalesQ)的中位数划分大小企业。
+. * ⚠️ 口径必须与 notebook 完全一致：notebook 用 df.groupby('Code')['SalesQ'].mean()，
+. *    其中 df 是"只缩尾、未插值、含全部 23 家企业（含 TSLA）"的样本；
+. *    若改用分析样本（已插值、剔 TSLA、只剩 21 家）计算，中位数会不同，
+. *    会把 LEAPMOTOR 这类企业分到另一组。因此这里专门回到 main 帧计算，
+. *    再按企业代码把分组结果并入分析样本。
+. display _n "【规模异质性】以各企业平均 SalesQ 的中位数分组（口径同 notebook）"
+
+【规模异质性】以各企业平均 SalesQ 的中位数分组（口径同 notebook）
+
+. capture frame drop fsize
+
+. frame copy main fsize
+
+. frame change fsize
+
+. bysort panel_id: egen firm_msalesq = mean(salesq)
+
+. egen tag_firm = tag(panel_id)
+
+. quietly summarize firm_msalesq if tag_firm, detail
+
+. scalar med_salesq = r(p50)
+
+. quietly keep if tag_firm
+
+. keep code firm_msalesq
+
+. tempfile fsize
+
+. quietly save `fsize'
+
+. frame change panel
+
+. xtset panel_id time
+
+Panel variable: panel_id (unbalanced)
+ Time variable: time, 0 to 22, but with gaps
+         Delta: 1 unit
+
+. merge m:1 code using `fsize', keep(master match) nogen
+
+    Result                      Number of obs
+    -----------------------------------------
+    Not matched                             0
+    Matched                               458  
+    -----------------------------------------
+
+. capture frame drop fsize
+
+. gen byte large_firm = firm_msalesq >= med_salesq
+
+. label variable large_firm "大规模企业(=1)"
+
+. display "  各企业平均 SalesQ 的中位数 = " %12.4f scalar(med_salesq) ///
+>         "（基于 23 家企业、未插值的缩尾样本）"
+  各企业平均 SalesQ 的中位数 =     123.9887（基于 23 家企业、未插值的缩尾样本）
+
+. display "  大规模企业："
+  大规模企业：
+
+. levelsof code if large_firm == 1, clean local(big)
+BYD CHANGAN FAWJEF FOTON GAC GWM LI SAIC SERES SINOTRUK
+
+. display "    `big'"
+    BYD CHANGAN FAWJEF FOTON GAC GWM LI SAIC SERES SINOTRUK
+
+. display "  小规模企业："
+  小规模企业：
+
+. levelsof code if large_firm == 0, clean local(small)
+ANKAI BAIC DFAC HANMA JAC JMC KINGLONG LEAPMOTOR XPEV YUTONG ZHONGTONG
+
+. display "    `small'"
+    ANKAI BAIC DFAC HANMA JAC JMC KINGLONG LEAPMOTOR XPEV YUTONG ZHONGTONG
+
+. 
+. display _n "【大规模企业】"
+
+【大规模企业】
+
+. xtreg tobinq subsidy_c rd_c cf_c gm_c salesq_c roe_c if large_firm == 1, fe vce(cluster panel_id)
+
+Fixed-effects (within) regression               Number of obs     =        223
+Group variable: panel_id                        Number of groups  =         10
+
+R-squared:                                      Obs per group:
+     Within  = 0.2839                                         min =         19
+     Between = 0.0167                                         avg =       22.3
+     Overall = 0.0455                                         max =         23
+
+                                                F(6, 9)           =       4.21
+corr(u_i, Xb) = -0.5270                         Prob > F          =     0.0269
+
+                              (Std. err. adjusted for 10 clusters in panel_id)
+------------------------------------------------------------------------------
+             |               Robust
+      tobinq | Coefficient  std. err.      t    P>|t|     [95% conf. interval]
+-------------+----------------------------------------------------------------
+   subsidy_c |  -8.526707   3.546982    -2.40   0.040    -16.55054   -.5028756
+        rd_c |   2.748489   3.354493     0.82   0.434    -4.839901    10.33688
+        cf_c |   1.602324    1.00432     1.60   0.145    -.6696049    3.874254
+        gm_c |   .2206119   1.555136     0.14   0.890     -3.29735    3.738574
+    salesq_c |  -.0009415    .000241    -3.91   0.004    -.0014866   -.0003965
+       roe_c |   .9305233   1.107114     0.84   0.422    -1.573943     3.43499
+       _cons |   1.725735   .0535629    32.22   0.000     1.604568    1.846903
+-------------+----------------------------------------------------------------
+     sigma_u |  .78076122
+     sigma_e |  .37722605
+         rho |  .81074365   (fraction of variance due to u_i)
+------------------------------------------------------------------------------
+
+. estimates store h_large
+
+. display _n "【小规模企业】"
+
+【小规模企业】
+
+. xtreg tobinq subsidy_c rd_c cf_c gm_c salesq_c roe_c if large_firm == 0, fe vce(cluster panel_id)
+
+Fixed-effects (within) regression               Number of obs     =        235
+Group variable: panel_id                        Number of groups  =         11
+
+R-squared:                                      Obs per group:
+     Within  = 0.0633                                         min =          5
+     Between = 0.4142                                         avg =       21.4
+     Overall = 0.0700                                         max =         23
+
+                                                F(6, 10)          =       1.67
+corr(u_i, Xb) = -0.8090                         Prob > F          =     0.2257
+
+                              (Std. err. adjusted for 11 clusters in panel_id)
+------------------------------------------------------------------------------
+             |               Robust
+      tobinq | Coefficient  std. err.      t    P>|t|     [95% conf. interval]
+-------------+----------------------------------------------------------------
+   subsidy_c |   -2.49923   2.506044    -1.00   0.342    -8.083045    3.084585
+        rd_c |  -3.827785   2.908451    -1.32   0.218    -10.30822    2.652647
+        cf_c |   .7329662   .8215944     0.89   0.393     -1.09766    2.563593
+        gm_c |   1.131234   .8546634     1.32   0.215    -.7730746    3.035543
+    salesq_c |  -.0058969   .0062608    -0.94   0.368    -.0198468     .008053
+       roe_c |  -.0342171   .3060337    -0.11   0.913    -.7161027    .6476685
+       _cons |   .0870558   1.699386     0.05   0.960    -3.699412    3.873524
+-------------+----------------------------------------------------------------
+     sigma_u |  .80343431
+     sigma_e |  .60308259
+         rho |  .63961247   (fraction of variance due to u_i)
+------------------------------------------------------------------------------
+
+. estimates store h_small
+
+. 
+. show_models m2_base m_soe1 m_soe0 h_large h_small, ///
+>     title("规模/所有制分组回归") ///
+>     mtitles("全样本" "国企" "非国企" "大型企业" "小型企业") ///
+>     keep(subsidy_c rd_c cf_c gm_c salesq_c roe_c) ///
+>     file("表_异质性分组.rtf")
+
+
+=============== 表：规模/所有制分组回归 ===============
+(output written to 表_异质性分组.rtf)
+
+. 
+. * --- 9.2 每家企业各自回归（cell 76/77）------------------------------------
+. * notebook 用 PooledOLS + cov_type='robust'（单企业无法识别企业固定效应），
+. * 对应 Stata 的 regress + vce(robust)。
+. display _n(2) "【9.2】各企业单独回归（企业数 = `nfirm'）"
+
+
+【9.2】各企业单独回归（企业数 = 21）
+
+. 
+. display _n "----- 版本A：TobinQ ~ Subsidy + RD + CF + GM + SalesQ + Subsidy_RD -----"
+
+----- 版本A：TobinQ ~ Subsidy + RD + CF + GM + SalesQ + Subsidy_RD -----
+
+. display "企业 | N | subsidy | rd | subsidy_rd (p值)"
+企业 | N | subsidy | rd | subsidy_rd (p值)
+
+. foreach c of local firm_list {
+  2.     capture quietly regress tobinq subsidy rd cf gm salesq subsidy_rd ///
+>         if code == "`c'", vce(robust)
+  3.     if _rc != 0 {
+  4.         display "`c' | 回归失败（解释变量缺失或共线）"
+  5.     }
+  6.     else if _se[subsidy_rd] == 0 | _se[subsidy] == 0 {
+  7.         display "`c' | " e(N) " | 系数被省略（该企业样本内变量无变异或与其它变量共线）"
+  8.     }
+  9.     else {
+ 10.         local b_i = _b[subsidy_rd]
+ 11.         local p_i = 2 * ttail(e(df_r), abs(_b[subsidy_rd]/_se[subsidy_rd]))
+ 12.         display "`c' | " e(N) " | " %9.4f _b[subsidy] " | " %9.4f _b[rd] ///
+>                 " | " %9.4f `b_i' "  (p = " %6.4f `p_i' ")"
+ 13.     }
+ 14. }
+ANKAI | 23 |    3.6863 |   -4.2636 | -183.2278  (p = 0.5370)
+BAIC | 23 |   11.4014 |   -0.4501 | -115.9839  (p = 0.1793)
+BYD | 23 |    6.4060 |   -4.0949 |  528.6078  (p = 0.7058)
+CHANGAN | 20 |  -14.4855 |  -11.9657 | -1.53e+03  (p = 0.1549)
+DFAC | 23 |    3.1100 |   -5.3742 |  146.3465  (p = 0.0365)
+FAWJEF | 23 |   -3.0631 |    2.3146 |    7.8158  (p = 0.7544)
+FOTON | 23 |   -5.3997 |    2.0407 |   57.5024  (p = 0.8494)
+GAC | 23 |    9.6507 |   -5.1417 |  401.1270  (p = 0.5294)
+GWM | 23 |  -16.0552 |  -34.5926 | -807.9879  (p = 0.8078)
+HANMA | 23 |  -10.7386 |   -6.0769 | -951.9372  (p = 0.1136)
+JAC | 23 |  -17.2429 |   14.6537 | -1.13e+03  (p = 0.2982)
+JMC | 23 |   -1.9294 |    0.2701 | -214.2844  (p = 0.4282)
+KINGLONG | 23 |    2.4946 |   -1.6398 |  370.3102  (p = 0.2708)
+LEAPMOTOR | 5 | 系数被省略（该企业样本内变量无变异或与其它变量共线）
+LI | 19 | -100.0552 |    3.2442 | -400.7939  (p = 0.7129)
+SAIC | 23 |   25.2728 |    6.7364 | 1055.1360  (p = 0.3819)
+SERES | 23 |  -11.0775 |   -9.3315 | -250.5914  (p = 0.7716)
+SINOTRUK | 23 |  337.0028 |  109.3032 | 9057.6554  (p = 0.5034)
+XPEV | 23 |   59.9754 |  -23.7281 | -846.2460  (p = 0.2897)
+YUTONG | 23 |   -9.5660 |  -24.9219 |  565.7726  (p = 0.1181)
+ZHONGTONG | 23 |   -4.8193 |   -3.5376 |  735.5337  (p = 0.1123)
+
+. 
+. display _n "----- 版本B：TobinQ ~ Subsidy + RD + Subsidy_RD -----"
+
+----- 版本B：TobinQ ~ Subsidy + RD + Subsidy_RD -----
+
+. display "企业 | N | subsidy | rd | subsidy_rd (p值)"
+企业 | N | subsidy | rd | subsidy_rd (p值)
+
+. foreach c of local firm_list {
+  2.     capture quietly regress tobinq subsidy rd subsidy_rd if code == "`c'", vce(robust)
+  3.     if _rc != 0 {
+  4.         display "`c' | 回归失败（解释变量缺失或共线）"
+  5.     }
+  6.     else if _se[subsidy_rd] == 0 | _se[subsidy] == 0 {
+  7.         display "`c' | " e(N) " | 系数被省略（该企业样本内变量无变异或与其它变量共线）"
+  8.     }
+  9.     else {
+ 10.         local b_i = _b[subsidy_rd]
+ 11.         local p_i = 2 * ttail(e(df_r), abs(_b[subsidy_rd]/_se[subsidy_rd]))
+ 12.         display "`c' | " e(N) " | " %9.4f _b[subsidy] " | " %9.4f _b[rd] ///
+>                 " | " %9.4f `b_i' "  (p = " %6.4f `p_i' ")"
+ 13.     }
+ 14. }
+ANKAI | 23 |    4.3148 |    1.2330 | -310.3547  (p = 0.2152)
+BAIC | 23 |   14.4784 |   -0.9015 | -141.1447  (p = 0.0024)
+BYD | 23 |   -6.9722 |  -29.0986 | 1552.5366  (p = 0.3031)
+CHANGAN | 20 |  -11.4875 |   -9.0550 | -968.6869  (p = 0.3580)
+DFAC | 23 |    2.4032 |   -0.8502 |   91.6220  (p = 0.1652)
+FAWJEF | 23 |   -3.8160 |    1.7996 |   19.2817  (p = 0.3409)
+FOTON | 23 |   -1.9030 |    3.2962 |  177.1024  (p = 0.5548)
+GAC | 23 |    5.8378 |  -17.2754 |  146.7844  (p = 0.8450)
+GWM | 23 |  -84.1099 |  -63.2079 | -7.49e+03  (p = 0.1616)
+HANMA | 23 |   -9.5939 |   -8.7308 | -981.3964  (p = 0.0237)
+JAC | 23 |  -18.1616 |   13.5783 | -504.4991  (p = 0.5986)
+JMC | 23 |   -2.5625 |   -0.7611 | -237.3166  (p = 0.1831)
+KINGLONG | 23 |    2.5579 |   -7.2729 |  128.6007  (p = 0.7990)
+LEAPMOTOR | 5 |  -43.2905 |   45.6025 | 4468.9241  (p = 0.8427)
+LI | 19 | -164.6754 |   -0.8307 | -389.2956  (p = 0.7415)
+SAIC | 23 |   42.1241 |    6.8244 | 1550.9172  (p = 0.1725)
+SERES | 23 |   -7.5729 |   -6.7097 | -424.7542  (p = 0.6012)
+SINOTRUK | 23 |  171.9979 |   46.4170 | 4171.9941  (p = 0.7529)
+XPEV | 23 |  -61.5378 |   -0.8747 |  273.6495  (p = 0.7002)
+YUTONG | 23 |  -13.1546 |  -28.4041 |  678.0378  (p = 0.0085)
+ZHONGTONG | 23 |   -3.7229 |   -2.2726 | -516.7457  (p = 0.3170)
+
+. 
+. *==============================================================================
+. * 第十部分：结果汇总
+. *==============================================================================
+. display _n(2) "=================================================="
+
+
+==================================================
+
+. display "第十部分：主要结果汇总"
+第十部分：主要结果汇总
+
+. display "=================================================="
+==================================================
+
+. show_models m1_twovar m2_base m3_nogm m4_lasso m_soeA m_soeB, ///
+>     title("主要模型汇总") ///
+>     mtitles("双变量" "基础模型" "无GM" "Lasso筛选" "模型A" "模型B") ///
+>     keep(subsidy_c rd_c subsidy_c_soe cf_c salesq_c gm_c) ///
+>     file("表_主要模型汇总.rtf")
+
+
+=============== 表：主要模型汇总 ===============
+(output written to 表_主要模型汇总.rtf)
+
+. 
+. display _n "已生成文件："
+
+已生成文件：
+
+. display "  - 面板分析_面板分析.log     运行日志（含全部回归输出）"
+  - 面板分析_面板分析.log     运行日志（含全部回归输出）
+
+. display "  - 表_*.rtf                  各结果表（esttab 可用时生成）"
+  - 表_*.rtf                  各结果表（esttab 可用时生成）
+
+. display "  - 图_pca企业聚类.png、图_lasso路径图.png"
+  - 图_pca企业聚类.png、图_lasso路径图.png
+
+. 
+. capture log close
